@@ -43,9 +43,12 @@ Home App 中的开关、亮度条、色温会驱动 LED；旋钮操作会反向�
 
 ## 构建与烧录
 
+`idf.py` **必须在本仓库根目录执行**（该目录下有 `CMakeLists.txt`）。clone 之后先 `cd` 进去，不要在 `esp-idf/examples` 或其他上级目录运行。
+
 ```bash
 git clone --recurse-submodules https://github.com/realDavy/BLEHomeKit.git
 cd BLEHomeKit
+ls CMakeLists.txt   # 确认当前就在工程根目录
 
 . $IDF_PATH/export.sh
 idf.py set-target esp32c3
@@ -56,8 +59,11 @@ idf.py -p /dev/ttyACM0 flash monitor
 如果 clone 时没有带子模块：
 
 ```bash
+cd BLEHomeKit
 git submodule update --init --recursive
 ```
+
+若出现 `CMakeLists.txt not found in project directory .../examples`，说明还在上级目录，执行 `cd BLEHomeKit` 后再跑 `idf.py`。
 
 USB 口打不开时，按官方下载模式：
 
