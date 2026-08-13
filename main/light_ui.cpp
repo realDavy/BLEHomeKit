@@ -57,7 +57,11 @@ void light_ui_start() {
 
     bsp_display_lock(0);
 
+#if LVGL_VERSION_MAJOR >= 9
+    lv_obj_t* scr = lv_screen_active();
+#else
     lv_obj_t* scr = lv_scr_act();
+#endif
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x101418), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
