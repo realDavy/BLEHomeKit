@@ -84,7 +84,7 @@ void LightController::set_brightness(int brightness) {
 }
 
 void LightController::set_color_temp(uint32_t mireds) {
-    mireds = std::clamp(mireds, 140u, 500u);
+    mireds = std::clamp<uint32_t>(mireds, 140, 500);
     Listener cb;
     State snapshot;
     {
