@@ -28,7 +28,9 @@ void LightController::init() {
     strip_config.strip_gpio_num = BOARD_RGB_LED;
     strip_config.max_leds = 1;
     strip_config.led_model = LED_MODEL_WS2812;
-#if defined(LED_PIXEL_FORMAT_GRB)
+#if defined(LED_STRIP_COLOR_COMPONENT_FMT_GRB)
+    strip_config.color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB;
+#elif defined(LED_PIXEL_FORMAT_GRB)
     strip_config.led_pixel_format = LED_PIXEL_FORMAT_GRB;
 #endif
 
