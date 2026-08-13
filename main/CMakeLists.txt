@@ -4,6 +4,7 @@ idf_component_register(
         "light_controller.cpp"
         "light_ui.cpp"
         "encoder_input.cpp"
+        "setup_code.cpp"
     INCLUDE_DIRS "."
     REQUIRES hap_wrapper yahap-pal esp_event nvs_flash driver esp_timer led_strip knob esp32_c3_lcdkit
 )

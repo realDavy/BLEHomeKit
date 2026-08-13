@@ -19,8 +19,6 @@
 #define BOARD_ENCODER_A        GPIO_NUM_10
 #endif
 
-// HomeKit setup code shown in the Home app (XXX-XX-XXX).
-#define HAP_SETUP_CODE         "111-22-333"
 #define HAP_DEVICE_NAME        "LCDkit Light"
 #define HAP_SETUP_ID           "LCKT"
 

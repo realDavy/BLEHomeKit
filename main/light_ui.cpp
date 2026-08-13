@@ -5,6 +5,8 @@
 #include "bsp/esp-bsp.h"
 #include "lvgl.h"
 
+#include <cstdio>
+
 
 static const char* TAG = "light_ui";
 
@@ -15,6 +17,7 @@ static lv_obj_t* s_status = nullptr;
 static lv_obj_t* s_setup = nullptr;
 static bool s_paired = false;
 static bool s_started = false;
+static char s_setup_code[12] = "---";
 
 static lv_color_t color_for_temp(uint32_t mireds) {
     const bool warm = mireds >= ((LIGHT_WARM_MIREDS + LIGHT_COOL_MIREDS) / 2);
@@ -43,7 +46,7 @@ static void render_state(const LightController::State& state) {
     } else {
         lv_label_set_text(s_status, "HomeKit BLE");
         lv_obj_clear_flag(s_setup, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(s_setup, "PIN " HAP_SETUP_CODE);
+        lv_label_set_text_fmt(s_setup, "PIN %s", s_setup_code);
     }
 }
 
@@ -103,6 +106,14 @@ void light_ui_start() {
 
     bsp_display_backlight_on();
     ESP_LOGI(TAG, "Light UI started");
+}
+
+void light_ui_set_setup_code(const char* setup_code) {
+    if (setup_code == nullptr || setup_code[0] == '\0') {
+        return;
+    }
+    std::snprintf(s_setup_code, sizeof(s_setup_code), "%s", setup_code);
+    light_ui_refresh();
 }
 
 void light_ui_set_paired(bool paired) {

@@ -15,6 +15,7 @@
 
 #include <functional>
 #include <memory>
+#include <string>
 #include <type_traits>
 #include <variant>
 
@@ -22,6 +23,7 @@
 #include "encoder_input.hpp"
 #include "light_controller.hpp"
 #include "light_ui.hpp"
+#include "setup_code.hpp"
 
 static const char* TAG = "HAP_LCDkit";
 
@@ -91,6 +93,9 @@ extern "C" void app_main() {
     });
 
     LightController::instance().init();
+    const std::string setup_code = hap_setup_code_from_mac();
+    const std::string serial = hap_serial_from_mac();
+    light_ui_set_setup_code(setup_code.c_str());
     light_ui_start();
     encoder_input_start_with_reset(factory_reset_hap);
 
@@ -106,7 +111,7 @@ extern "C" void app_main() {
     config.ble = &ble_impl;
     config.network = nullptr;
     config.device_name = HAP_DEVICE_NAME;
-    config.setup_code = HAP_SETUP_CODE;
+    config.setup_code = setup_code;
     config.category_id = hap::core::AccessoryCategory::Lightbulb;
     config.on_identify = []() {
         LightController::instance().identify();
@@ -124,7 +129,7 @@ extern "C" void app_main() {
         .name(HAP_DEVICE_NAME)
         .manufacturer("Espressif")
         .model("ESP32-C3-LCDkit")
-        .serial_number("C3LCDKIT01")
+        .serial_number(serial)
         .firmware_revision("1.0.0")
         .hardware_revision("ESP32-C3-MINI-1")
         .on_identify([]() {
@@ -193,7 +198,7 @@ extern "C" void app_main() {
         hap_sync_from_light(state);
     });
 
-    ESP_LOGI(TAG, "HAP-BLE advertising as '%s', setup code %s", HAP_DEVICE_NAME, HAP_SETUP_CODE);
+    ESP_LOGI(TAG, "HAP-BLE advertising as '%s', setup code %s", HAP_DEVICE_NAME, setup_code.c_str());
     server.start();
 
     while (true) {
