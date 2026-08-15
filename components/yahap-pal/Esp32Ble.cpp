@@ -25,9 +25,6 @@
 
 static const char *TAG = "Esp32Ble";
 
-static const char *KEY_BLE_ADDR = "ble_addr";
-static const char *KEY_BLE_ADDR_CN = "ble_addr_cn";
-
 static hap::platform::Storage *g_storage = nullptr;
 
 std::vector<Esp32Ble::CharacteristicContext *> Esp32Ble::all_contexts;
@@ -39,52 +36,6 @@ static std::optional<Esp32Ble::Advertisement> pending_adv;
 static std::optional<Esp32Ble::Advertisement> last_adv;
 static uint32_t pending_adv_interval = 0;
 static uint32_t last_adv_interval = 20;
-
-static bool load_stored_address(uint8_t addr[6], uint8_t *stored_cn) {
-  if (!g_storage)
-    return false;
-
-  auto addr_data = g_storage->get(KEY_BLE_ADDR);
-  auto cn_data = g_storage->get(KEY_BLE_ADDR_CN);
-
-  if (!addr_data || addr_data->size() != 6 || !cn_data || cn_data->empty()) {
-    return false;
-  }
-
-  memcpy(addr, addr_data->data(), 6);
-  *stored_cn =
-      (uint8_t)atoi(std::string(cn_data->begin(), cn_data->end()).c_str());
-  return true;
-}
-
-static void save_address(const uint8_t addr[6], uint8_t cn) {
-  if (!g_storage) {
-    ESP_LOGE(TAG, "No storage interface available");
-    return;
-  }
-
-  std::vector<uint8_t> addr_vec(addr, addr + 6);
-  std::string cn_str = std::to_string(cn);
-  std::vector<uint8_t> cn_vec(cn_str.begin(), cn_str.end());
-
-  g_storage->set(KEY_BLE_ADDR, addr_vec);
-  g_storage->set(KEY_BLE_ADDR_CN, cn_vec);
-  ESP_LOGI(TAG, "Saved BLE address for CN=%d", cn);
-}
-
-static uint8_t get_current_cn() {
-  if (!g_storage)
-    return 1;
-
-  auto cn_data = g_storage->get("config_number");
-  if (cn_data && !cn_data->empty()) {
-    std::string cn_str(cn_data->begin(), cn_data->end());
-    uint8_t cn = (uint8_t)atoi(cn_str.c_str());
-    ESP_LOGI(TAG, "Read CN=%d from storage", cn);
-    return cn;
-  }
-  return 1;
-}
 
 static void parse_uuid(const std::string &uuid_str, ble_uuid_any_t *uuid) {
   ESP_LOGD(TAG, "Parsing UUID: %s", uuid_str.c_str());

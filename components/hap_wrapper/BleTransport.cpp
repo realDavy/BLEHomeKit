@@ -14,6 +14,20 @@
 #include "hap/transport/ble/BleTlvBuilder.hpp"
 #include "hap/core/CharacteristicSerializer.hpp"
 
+static bool s_adv_dirty = false;
+
+static bool hap_list_means_paired(hap::platform::Storage* storage) {
+    if (!storage) {
+        return false;
+    }
+    auto pairing_list = storage->get("pairing_list");
+    if (!pairing_list || pairing_list->size() <= 2) {
+        return false;
+    }
+    std::string s(pairing_list->begin(), pairing_list->end());
+    return !s.empty() && s.front() == '[' && s.back() == ']' && s != "[]";
+}
+
 static std::string to_hex_string(const uint8_t* data, size_t len) {
     std::string s;
     char buf[3];
@@ -56,7 +70,7 @@ void BleTransport::start() {
         
         config_.system->log(platform::System::LogLevel::Info, 
             "[BleTransport] Connection state cleaned up, refreshing advertising");
-        
+        s_adv_dirty = false;
         update_advertising();
     });
 
@@ -353,6 +367,13 @@ void BleTransport::setup_protocol_info_service() {
 }
 
 void BleTransport::update_advertising() {
+    if (session_manager_ && session_manager_->session_count() > 0) {
+        s_adv_dirty = true;
+        config_.system->log(platform::System::LogLevel::Info,
+            "[BleTransport] Defer advertising update until disconnect (avoid nimble stack overflow)");
+        return;
+    }
+
     config_.system->log(platform::System::LogLevel::Info, "[BleTransport] update_advertising entry");
     
     auto setup_id_bytes = config_.storage->get("setup_id");
@@ -388,8 +409,7 @@ void BleTransport::update_advertising() {
     uint8_t setup_hash[4];
     std::copy_n(hash_output.begin(), 4, setup_hash);
     
-    // Always advertise unpaired so Home can find this accessory.
-    uint8_t status_flags = 0x01;
+    uint8_t status_flags = hap_list_means_paired(config_.storage) ? 0x00 : 0x01;
     
     uint8_t device_id[6] = {0};
     int scanned = sscanf(config_.accessory_id.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
@@ -1920,8 +1940,7 @@ void BleTransport::send_disconnected_event(uint16_t iid) {
     uint8_t setup_hash[4];
     std::copy_n(hash_output.begin(), 4, setup_hash);
     
-    // Always advertise unpaired so Home can find this accessory.
-    uint8_t status_flags = 0x01;
+    uint8_t status_flags = hap_list_means_paired(config_.storage) ? 0x00 : 0x01;
     
     uint8_t device_id[6] = {0};
     sscanf(config_.accessory_id.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",

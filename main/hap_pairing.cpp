@@ -107,53 +107,12 @@ static bool hap_nvs_has_pairing_list() {
     return err == ESP_OK && len > 0;
 }
 
-static void hap_nvs_erase_hap_storage() {
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open("hap_storage", NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "hap_storage open failed: %s", esp_err_to_name(err));
-        return;
-    }
-    err = nvs_erase_all(handle);
-    ESP_LOGW(TAG, "nvs_erase_all(hap_storage)=%s", esp_err_to_name(err));
-    err = nvs_commit(handle);
-    ESP_LOGW(TAG, "nvs_commit(hap_storage)=%s", esp_err_to_name(err));
-    nvs_close(handle);
-}
-
 void hap_wipe_legacy_nvs() {
-    nvs_handle_t handle;
-    if (nvs_open("hap_storage", NVS_READWRITE, &handle) != ESP_OK) {
-        ESP_LOGE(TAG, "hap_storage open failed");
-        return;
-    }
-
-    size_t len = 0;
-    if (nvs_get_blob(handle, "pairing_list", nullptr, &len) == ESP_OK && len > 0) {
-        std::vector<uint8_t> buf(len);
-        nvs_get_blob(handle, "pairing_list", buf.data(), &len);
-        ESP_LOGW(TAG, "Boot unpair: pairing_list (%u bytes) %.*s",
-                 static_cast<unsigned>(len), static_cast<int>(len),
-                 reinterpret_cast<const char*>(buf.data()));
-    } else {
-        ESP_LOGI(TAG, "Boot unpair: pairing_list already empty");
-    }
-
-    const esp_err_t e1 = nvs_erase_key(handle, "pairing_list");
-    const esp_err_t e2 = nvs_erase_key(handle, "gsn");
-    const esp_err_t e3 = nvs_erase_key(handle, "ble_addr");
-    const esp_err_t e4 = nvs_erase_key(handle, "ble_addr_cn");
-    ESP_LOGW(TAG, "Boot unpair: erase pairing_list=%s gsn=%s ble_addr=%s",
-             esp_err_to_name(e1), esp_err_to_name(e2), esp_err_to_name(e3));
-    (void)e4;
-    nvs_commit(handle);
-    nvs_close(handle);
-
     if (hap_nvs_has_pairing_list()) {
-        ESP_LOGE(TAG, "pairing_list still present, erasing hap_storage");
-        hap_nvs_erase_hap_storage();
+        ESP_LOGI(TAG, "NVS pairing_list present (will persist across reboot)");
+    } else {
+        ESP_LOGI(TAG, "NVS pairing_list absent");
     }
-    ESP_LOGW(TAG, "Boot unpair done — HomeKit will advertise SF=1");
 }
 
 void hap_clear_controller_pairings(hap::platform::Storage& storage) {
@@ -174,12 +133,37 @@ void hap_clear_controller_pairings(hap::platform::Storage& storage) {
 
 bool hap_sanitize_pairings(hap::platform::Storage& storage) {
     auto list = storage.get("pairing_list");
-    if (list && !list->empty()) {
-        const std::string raw(list->begin(), list->end());
-        ESP_LOGW(TAG, "Clearing leftover pairing_list (%u bytes): %s",
-                 static_cast<unsigned>(raw.size()), raw.c_str());
-        hap_clear_controller_pairings(storage);
+    if (!list || list->empty()) {
+        ESP_LOGI(TAG, "HAP pairings: none (SF=1)");
+        return false;
     }
-    ESP_LOGI(TAG, "HAP pairings: none (SF=1)");
-    return false;
+
+    const std::string raw(list->begin(), list->end());
+    ESP_LOGI(TAG, "HAP pairing_list (%u bytes): %s",
+             static_cast<unsigned>(raw.size()), raw.c_str());
+
+    std::vector<std::string> ids;
+    if (!parse_pairing_ids(raw, ids) || ids.empty()) {
+        ESP_LOGW(TAG, "pairing_list is empty or invalid; advertising unpaired (SF=1)");
+        hap_clear_controller_pairings(storage);
+        return false;
+    }
+
+    bool all_ok = true;
+    for (const auto& id : ids) {
+        auto ltpk = storage.get(std::string("pairing_") + id);
+        if (!ltpk || ltpk->size() != 32) {
+            ESP_LOGW(TAG, "pairing_%s missing or not 32 bytes", id.c_str());
+            all_ok = false;
+        }
+    }
+    if (!all_ok) {
+        ESP_LOGW(TAG, "Incomplete pairings cleared; advertising unpaired (SF=1)");
+        hap_clear_controller_pairings(storage);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "HAP pairings: %u valid controller(s) (SF=0)",
+             static_cast<unsigned>(ids.size()));
+    return true;
 }

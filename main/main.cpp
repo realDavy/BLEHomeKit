@@ -192,9 +192,15 @@ extern "C" void app_main() {
     config.on_identify = []() {
         LightController::instance().identify();
     };
-    config.on_pairings_changed = [](const hap::PairingEvent& event) {
-        ESP_LOGI(TAG, "Pairing event %d id=%s", static_cast<int>(event.type), event.pairing_id.c_str());
-        light_ui_set_paired(event.type == hap::PairingEventType::Added);
+    config.on_pairings_changed = [work_queue](const hap::PairingEvent& event) {
+        auto* job = new std::function<void()>([event]() {
+            ESP_LOGI(TAG, "Pairing event %d id=%s",
+                     static_cast<int>(event.type), event.pairing_id.c_str());
+            light_ui_set_paired(event.type == hap::PairingEventType::Added);
+        });
+        if (xQueueSend(work_queue, &job, 0) != pdTRUE) {
+            delete job;
+        }
     };
 
     static hap::AccessoryServer server(std::move(config));
