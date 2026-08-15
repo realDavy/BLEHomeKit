@@ -1,10 +1,13 @@
 // Local overlay of hap/src/transport/BleTransport.cpp:
 // fragment HAP-BLE GATT reads to ATT MTU, do not apply the 10s
 // procedure timeout while waiting for the next pair-setup write,
-// keep SF=1 until Pair-Verify, do not register an empty 0xFE59 GATT service,
-// coalesce disconnected-event GSN bumps, avoid 500 ms advertising after drop,
-// and disconnect after Home RemovePairing so advertising returns to SF=1.
+// keep SF=1 until Pair-Verify then push SF=0 immediately (Home scans
+// for the paired accessory while still connected), do not register an
+// empty 0xFE59 GATT service, coalesce disconnected-event GSN bumps,
+// avoid 500 ms advertising after drop, and disconnect after Home
+// RemovePairing so advertising returns to SF=1.
 #include "hap/transport/BleTransport.hpp"
+#include "hap/common/TaskScheduler.hpp"
 #include "hap/transport/ConnectionContext.hpp"
 #include "hap/core/CharacteristicFinder.hpp"
 #include "hap/core/HAPStatus.hpp"
@@ -22,11 +25,13 @@
 #include "hap/transport/ble/BleTlvBuilder.hpp"
 #include "hap/core/CharacteristicSerializer.hpp"
 
-static bool s_adv_dirty = false;
 static bool s_gsn_bumped_while_disconnected = false;
 static uint32_t s_exclude_conn_id = UINT32_MAX;
 static uint16_t s_disconnect_after_read = 0;
 static constexpr const char* kPairVerifiedKey = "pair_verified";
+static bool s_setup_hash_ready = false;
+static uint8_t s_cached_setup_hash[4] = {};
+static std::string s_cached_hash_input;
 
 static bool hap_list_means_paired(hap::platform::Storage* storage) {
     if (!storage) {
@@ -94,20 +99,35 @@ static void hap_after_pairings(hap::platform::Storage* storage, hap::platform::S
     }
 }
 
-static void hap_note_pair_verify_done(hap::platform::Storage* storage, hap::platform::System* system,
+static bool hap_note_pair_verify_done(hap::platform::Storage* storage, hap::platform::System* system,
                                      bool encrypted) {
     if (!encrypted || !storage) {
-        return;
+        return false;
     }
     auto verified = storage->get(kPairVerifiedKey);
     if (verified && !verified->empty() && (*verified)[0] == '1') {
-        return;
+        return false;
     }
     storage->set(kPairVerifiedKey, std::vector<uint8_t>{'1'});
     if (system) {
         system->log(hap::platform::System::LogLevel::Info,
-            "[BleTransport] Pair-Verify succeeded; next advertisement uses SF=0");
+            "[BleTransport] Pair-Verify succeeded; advertise SF=0 while still connected");
     }
+    return true;
+}
+
+// Run advertising update on the HAP tick task, not the NimBLE host
+// (SHA-512 + gap restart used to overflow nimble_host).
+static void hap_schedule_paired_advertising(hap::transport::BleTransport* transport,
+                                           hap::common::TaskScheduler* scheduler) {
+    if (!transport) {
+        return;
+    }
+    if (scheduler) {
+        scheduler->schedule_once(0, [transport]() { transport->update_advertising(); });
+        return;
+    }
+    transport->update_advertising();
 }
 
 static std::string to_hex_string(const uint8_t* data, size_t len) {
@@ -152,7 +172,6 @@ void BleTransport::start() {
         
         config_.system->log(platform::System::LogLevel::Info, 
             "[BleTransport] Connection state cleaned up, refreshing advertising");
-        s_adv_dirty = false;
         s_gsn_bumped_while_disconnected = false;
         if (s_disconnect_after_read == connection_id) {
             s_disconnect_after_read = 0;
@@ -446,13 +465,9 @@ void BleTransport::setup_protocol_info_service() {
 }
 
 void BleTransport::update_advertising() {
-    if (session_manager_ && session_manager_->session_count() > 0) {
-        s_adv_dirty = true;
-        config_.system->log(platform::System::LogLevel::Info,
-            "[BleTransport] Defer advertising update until disconnect (avoid nimble stack overflow)");
-        return;
-    }
-
+    // Do not defer while connected. After Pair-Verify, Home scans for SF=0
+    // during the still-connected Add Accessory session. Esp32Ble updates
+    // the payload in place so this does not stop advertising.
     config_.system->log(platform::System::LogLevel::Info, "[BleTransport] update_advertising entry");
     
     auto setup_id_bytes = config_.storage->get("setup_id");
@@ -472,21 +487,27 @@ void BleTransport::update_advertising() {
     }
     
     std::string input = setup_id + config_.accessory_id;
-    std::vector<uint8_t> hash_output(64);
-    config_.system->log(platform::System::LogLevel::Debug, "[BleTransport] Calculating Setup Hash for: " + input);
-    
-    if (config_.crypto == nullptr) {
-         config_.system->log(platform::System::LogLevel::Error, "[BleTransport] No crypto provider!");
-         return;
-    }
-
-    config_.crypto->sha512(
-        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(input.data()), input.size()), 
-        std::span<uint8_t, 64>(hash_output.data(), 64)
-    );
-    
     uint8_t setup_hash[4];
-    std::copy_n(hash_output.begin(), 4, setup_hash);
+    if (s_setup_hash_ready && s_cached_hash_input == input) {
+        std::memcpy(setup_hash, s_cached_setup_hash, sizeof(setup_hash));
+    } else {
+        std::vector<uint8_t> hash_output(64);
+        config_.system->log(platform::System::LogLevel::Debug, "[BleTransport] Calculating Setup Hash for: " + input);
+
+        if (config_.crypto == nullptr) {
+             config_.system->log(platform::System::LogLevel::Error, "[BleTransport] No crypto provider!");
+             return;
+        }
+
+        config_.crypto->sha512(
+            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(input.data()), input.size()),
+            std::span<uint8_t, 64>(hash_output.data(), 64)
+        );
+        std::copy_n(hash_output.begin(), 4, setup_hash);
+        std::memcpy(s_cached_setup_hash, setup_hash, sizeof(s_cached_setup_hash));
+        s_cached_hash_input = input;
+        s_setup_hash_ready = true;
+    }
     
     uint8_t status_flags = hap_should_advertise_paired(config_.storage) ? 0x00 : 0x01;
     
@@ -546,6 +567,7 @@ void BleTransport::update_advertising() {
 
 void BleTransport::set_accessory_id(const std::string& new_id) {
     config_.accessory_id = new_id;
+    s_setup_hash_ready = false;
     config_.system->log(platform::System::LogLevel::Info, 
         "[BleTransport] Accessory ID updated to: " + new_id);
 }
@@ -1035,7 +1057,9 @@ void BleTransport::process_transaction(uint16_t connection_id, TransactionState&
              } else if (type == 0x4E) { // Pair Verify
                 req.path = "/pair-verify";
                 resp = config_.pairing_endpoints->handle_pair_verify(req, ctx);
-                hap_note_pair_verify_done(config_.storage, config_.system, ctx.is_encrypted());
+                if (hap_note_pair_verify_done(config_.storage, config_.system, ctx.is_encrypted())) {
+                    hap_schedule_paired_advertising(this, config_.scheduler);
+                }
              } else if (type == 0x50) { // Pairings
                 req.path = "/pairings";
                 resp = config_.pairing_endpoints->handle_pairings(req, ctx);
@@ -1240,7 +1264,9 @@ void BleTransport::process_transaction(uint16_t connection_id, TransactionState&
                 } else if (type == 0x4E) {
                     req.path = "/pair-verify";
                     resp = config_.pairing_endpoints->handle_pair_verify(req, ctx);
-                    hap_note_pair_verify_done(config_.storage, config_.system, ctx.is_encrypted());
+                    if (hap_note_pair_verify_done(config_.storage, config_.system, ctx.is_encrypted())) {
+                        hap_schedule_paired_advertising(this, config_.scheduler);
+                    }
                 } else if (type == 0x50) {
                     req.path = "/pairings";
                     resp = config_.pairing_endpoints->handle_pairings(req, ctx);
@@ -1562,7 +1588,9 @@ bool BleTransport::process_characteristic_write(uint16_t connection_id, uint16_t
         req.path = "/pair-verify";
         
         auto resp = config_.pairing_endpoints->handle_pair_verify(req, *session.context);
-        hap_note_pair_verify_done(config_.storage, config_.system, session.context->is_encrypted());
+        if (hap_note_pair_verify_done(config_.storage, config_.system, session.context->is_encrypted())) {
+            hap_schedule_paired_advertising(this, config_.scheduler);
+        }
         uint8_t status = (resp.status == Status::OK) ? 0x00 : 0x05;
         send_response(connection_id, tid, uuid, status, resp.body);
         return true;

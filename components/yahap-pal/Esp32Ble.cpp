@@ -121,6 +121,85 @@ static void use_hap_static_random_addr() {
   g_own_addr_type = BLE_OWN_ADDR_RANDOM;
 }
 
+static void log_adv_identity(const hap::platform::Ble::Advertisement &data) {
+  uint8_t adva[6] = {};
+  ble_hs_id_copy_addr(g_own_addr_type, adva, nullptr);
+  ESP_LOGI(TAG, "AdvA type=%d %02X:%02X:%02X:%02X:%02X:%02X", g_own_addr_type,
+           adva[5], adva[4], adva[3], adva[2], adva[1], adva[0]);
+  if (data.manufacturer_data.size() >= 9 && data.manufacturer_data[0] == 0x06) {
+    const uint8_t *id = data.manufacturer_data.data() + 3;
+    ESP_LOGI(TAG, "HAP Device ID %02X:%02X:%02X:%02X:%02X:%02X SF=%u", id[0],
+             id[1], id[2], id[3], id[4], id[5], data.manufacturer_data[2]);
+    if (!(adva[5] == id[0] && adva[4] == id[1] && adva[3] == id[2] &&
+          adva[2] == id[3] && adva[1] == id[4] && adva[0] == id[5])) {
+      ESP_LOGW(TAG, "AdvA != Device ID; Home will show 未响应 after pairing");
+    }
+  }
+}
+
+// Update manufacturer data / name without ble_gap_adv_stop. Home scans for
+// SF=0 during Add Accessory while the iPhone is still connected; a stop/start
+// gap there looks like 未响应.
+static int apply_advertising_fields(const hap::platform::Ble::Advertisement &data) {
+  struct ble_hs_adv_fields adv_fields;
+  struct ble_hs_adv_fields rsp_fields;
+  memset(&adv_fields, 0, sizeof adv_fields);
+  memset(&rsp_fields, 0, sizeof rsp_fields);
+
+  adv_fields.flags = data.flags;
+
+  std::vector<uint8_t> mfg_payload;
+  if (!data.manufacturer_data.empty() || data.company_id != 0) {
+    mfg_payload.reserve(2 + data.manufacturer_data.size());
+    mfg_payload.push_back(data.company_id & 0xFF);
+    mfg_payload.push_back((data.company_id >> 8) & 0xFF);
+    mfg_payload.insert(mfg_payload.end(), data.manufacturer_data.begin(),
+                       data.manufacturer_data.end());
+    adv_fields.mfg_data = mfg_payload.data();
+    adv_fields.mfg_data_len = mfg_payload.size();
+  }
+
+  if (data.local_name.has_value()) {
+    rsp_fields.name = (uint8_t *)data.local_name.value().c_str();
+    rsp_fields.name_len = data.local_name.value().size();
+    rsp_fields.name_is_complete = 1;
+  }
+
+  static const ble_uuid16_t hap_uuid = BLE_UUID16_INIT(0xFE59);
+  adv_fields.uuids16 = &hap_uuid;
+  adv_fields.num_uuids16 = 1;
+  adv_fields.uuids16_is_complete = 1;
+  rsp_fields.uuids16 = &hap_uuid;
+  rsp_fields.num_uuids16 = 1;
+  rsp_fields.uuids16_is_complete = 1;
+
+  int rc = ble_gap_adv_set_fields(&adv_fields);
+  if (rc != 0) {
+    ESP_LOGW(TAG, "adv fields with FE59 failed rc=%d, retry without UUID", rc);
+    adv_fields.uuids16 = nullptr;
+    adv_fields.num_uuids16 = 0;
+    rc = ble_gap_adv_set_fields(&adv_fields);
+  } else {
+    ESP_LOGI(TAG, "Advertisement includes 0xFE59");
+  }
+  if (rc != 0) {
+    ESP_LOGE(TAG, "error setting adv fields; rc=%d", rc);
+    return rc;
+  }
+
+  rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
+  if (rc != 0) {
+    ESP_LOGW(TAG, "scan rsp with FE59 failed rc=%d, retry name only", rc);
+    rsp_fields.uuids16 = nullptr;
+    rsp_fields.num_uuids16 = 0;
+    rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
+  }
+  if (rc != 0) {
+    ESP_LOGE(TAG, "error setting rsp fields; rc=%d", rc);
+  }
+  return rc;
+}
+
 static void parse_uuid(const std::string &uuid_str, ble_uuid_any_t *uuid) {
   ESP_LOGD(TAG, "Parsing UUID: %s", uuid_str.c_str());
 
@@ -221,79 +300,40 @@ void Esp32Ble::start_advertising(const Advertisement &data,
     interval_ms = 20;
   }
 
-  if (last_adv.has_value() && last_adv_interval == interval_ms &&
+  const bool same_payload =
+      last_adv.has_value() && last_adv_interval == interval_ms &&
       last_adv->manufacturer_data == data.manufacturer_data &&
       last_adv->local_name == data.local_name && last_adv->flags == data.flags &&
-      last_adv->company_id == data.company_id && ble_gap_adv_active()) {
+      last_adv->company_id == data.company_id;
+
+  if (same_payload && ble_gap_adv_active()) {
     ESP_LOGD(TAG, "Advertising already current, skip restart");
     return;
   }
 
+  // Flip SF / GSN without stopping. iPhone scans for SF=0 while still
+  // connected at the end of Add Accessory.
+  if (ble_gap_adv_active() && last_adv_interval == interval_ms) {
+    const int rc = apply_advertising_fields(data);
+    if (rc == 0) {
+      last_adv = data;
+      last_adv_interval = interval_ms;
+      ESP_LOGI(TAG, "Advertising payload updated in place");
+      log_adv_identity(data);
+      return;
+    }
+    ESP_LOGW(TAG, "In-place adv update failed rc=%d, restarting", rc);
+  }
+
   ble_gap_adv_stop();
+  use_hap_static_random_addr();
+
+  const int fields_rc = apply_advertising_fields(data);
+  if (fields_rc != 0) {
+    return;
+  }
 
   struct ble_gap_adv_params adv_params;
-  struct ble_hs_adv_fields adv_fields;
-  struct ble_hs_adv_fields rsp_fields;
-  int rc;
-
-  memset(&adv_fields, 0, sizeof adv_fields);
-  memset(&rsp_fields, 0, sizeof rsp_fields);
-
-  adv_fields.flags = data.flags;
-
-  std::vector<uint8_t> mfg_payload;
-  if (!data.manufacturer_data.empty() || data.company_id != 0) {
-    mfg_payload.reserve(2 + data.manufacturer_data.size());
-    mfg_payload.push_back(data.company_id & 0xFF); // LE
-    mfg_payload.push_back((data.company_id >> 8) & 0xFF);
-    mfg_payload.insert(mfg_payload.end(), data.manufacturer_data.begin(),
-                       data.manufacturer_data.end());
-
-    adv_fields.mfg_data = mfg_payload.data();
-    adv_fields.mfg_data_len = mfg_payload.size();
-  }
-
-  if (data.local_name.has_value()) {
-    rsp_fields.name = (uint8_t *)data.local_name.value().c_str();
-    rsp_fields.name_len = data.local_name.value().size();
-    rsp_fields.name_is_complete = 1;
-  }
-
-  // HAP-BLE accessories also advertise the 16-bit service UUID 0xFE59.
-  static const ble_uuid16_t hap_uuid = BLE_UUID16_INIT(0xFE59);
-  adv_fields.uuids16 = &hap_uuid;
-  adv_fields.num_uuids16 = 1;
-  adv_fields.uuids16_is_complete = 1;
-  rsp_fields.uuids16 = &hap_uuid;
-  rsp_fields.num_uuids16 = 1;
-  rsp_fields.uuids16_is_complete = 1;
-
-  rc = ble_gap_adv_set_fields(&adv_fields);
-  if (rc != 0) {
-    ESP_LOGW(TAG, "adv fields with FE59 failed rc=%d, retry without UUID", rc);
-    adv_fields.uuids16 = nullptr;
-    adv_fields.num_uuids16 = 0;
-    rc = ble_gap_adv_set_fields(&adv_fields);
-  } else {
-    ESP_LOGI(TAG, "Advertisement includes 0xFE59");
-  }
-  if (rc != 0) {
-    ESP_LOGE(TAG, "error setting adv fields; rc=%d", rc);
-    return;
-  }
-
-  rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
-  if (rc != 0) {
-    ESP_LOGW(TAG, "scan rsp with FE59 failed rc=%d, retry name only", rc);
-    rsp_fields.uuids16 = nullptr;
-    rsp_fields.num_uuids16 = 0;
-    rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
-  }
-  if (rc != 0) {
-    ESP_LOGE(TAG, "error setting rsp fields; rc=%d", rc);
-    return;
-  }
-
   memset(&adv_params, 0, sizeof adv_params);
   adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
   adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
@@ -301,14 +341,15 @@ void Esp32Ble::start_advertising(const Advertisement &data,
   adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(interval_ms);
   adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(interval_ms);
 
-  rc = ble_gap_adv_start(g_own_addr_type, NULL, BLE_HS_FOREVER, &adv_params,
-                         ble_gap_event, this);
+  const int rc = ble_gap_adv_start(g_own_addr_type, NULL, BLE_HS_FOREVER,
+                                   &adv_params, ble_gap_event, this);
   if (rc != 0) {
     ESP_LOGE(TAG, "error enabling advertisement; rc=%d", rc);
   } else {
     ESP_LOGI(TAG, "Advertising started");
     last_adv = data;
     last_adv_interval = interval_ms;
+    log_adv_identity(data);
   }
 }
 
