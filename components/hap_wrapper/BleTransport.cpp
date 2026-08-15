@@ -5,9 +5,10 @@
 // for the paired accessory while still connected), do not register an
 // empty 0xFE59 GATT service, bump GSN on every disconnected knob change,
 // push current On/Brightness/CT as soon as Pair-Verify and CCCDs are
-// both ready (Home often subscribes after Verify), avoid 500 ms
-// advertising after drop, and disconnect after Home RemovePairing so
-// advertising returns to SF=1.
+// both ready (Home often subscribes after Verify), do not treat a Home
+// write as "still pairing" just because the writer is the only
+// subscriber, avoid 500 ms advertising after drop, and disconnect after
+// Home RemovePairing so advertising returns to SF=1.
 #include "hap/transport/BleTransport.hpp"
 #include "hap/common/TaskScheduler.hpp"
 #include "hap/transport/ConnectionContext.hpp"
@@ -2063,27 +2064,37 @@ void BleTransport::handle_characteristic_change(uint64_t aid, uint64_t iid,
     }
     std::string uuid = it->second;
     
-    bool has_connected_subscribers = false;
+    const bool from_controller =
+        exclude_conn_id != 0 && exclude_conn_id != UINT32_MAX;
+    bool has_other_subscribers = false;
     if (session_manager_->has_subscribers(uuid)) {
         for (uint16_t conn_id : session_manager_->get_subscribers(uuid)) {
             if (conn_id != exclude_conn_id) {
-                has_connected_subscribers = true;
+                has_other_subscribers = true;
                 break;
             }
         }
     }
-    
+
     const uint16_t radio_links =
         config_.ble ? config_.ble->active_connections() : 0;
     const bool encrypted = hap_session_encrypted(session_manager_.get());
     is_connected_ = encrypted;
-    
-    if (encrypted && has_connected_subscribers && supports_connected) {
+
+    if (encrypted && supports_connected && has_other_subscribers) {
         s_exclude_conn_id = exclude_conn_id;
         config_.system->log(platform::System::LogLevel::Info,
             "[BleTransport] Sending Connected Event for IID=" + std::to_string(iid));
         send_connected_event(static_cast<uint16_t>(iid));
         s_exclude_conn_id = UINT32_MAX;
+    }
+    else if (encrypted && from_controller) {
+        // Home already wrote this value. HAP 7.4.6.1: do not indicate
+        // the originator. The old "Hold until Pair-Verify" path ran
+        // here because the writer was the only subscriber.
+        config_.system->log(platform::System::LogLevel::Debug,
+            "[BleTransport] Skip echo IID=" + std::to_string(iid) +
+            " to the controller that wrote it");
     }
     else if (radio_links == 0 && supports_broadcast && broadcast_enabled && is_broadcast_key_valid()) {
         config_.system->log(platform::System::LogLevel::Info,
@@ -2093,23 +2104,20 @@ void BleTransport::handle_characteristic_change(uint64_t aid, uint64_t iid,
     else if (radio_links == 0 && supports_disconnected) {
         send_disconnected_event(static_cast<uint16_t>(iid));
     }
-    else if (radio_links > 0) {
-        // BLE is up but Pair-Verify and/or indicate subscribe is not done.
-        // Bumping GSN here makes Home stay on 正在更新. Remember local
-        // knob changes and flush them as soon as indications are live.
-        if (exclude_conn_id == 0 || exclude_conn_id == UINT32_MAX) {
-            hap_remember_held_iid(static_cast<uint16_t>(iid));
-            s_pending_state_push = true;
-        }
+    else if (radio_links > 0 && !from_controller) {
+        // Local knob while Pair-Verify / CCCD is still in progress.
+        // Bumping GSN here makes Home stay on 正在更新.
+        hap_remember_held_iid(static_cast<uint16_t>(iid));
+        s_pending_state_push = true;
         config_.system->log(platform::System::LogLevel::Info,
             "[BleTransport] Hold event IID=" + std::to_string(iid) +
             " until controller finishes Pair-Verify");
     }
     else {
         config_.system->log(platform::System::LogLevel::Debug,
-            "[BleTransport] No event sent for IID=" + std::to_string(iid) + 
+            "[BleTransport] No event sent for IID=" + std::to_string(iid) +
             " (connected=" + std::to_string(is_connected_) +
-            ", has_subs=" + std::to_string(has_connected_subscribers) +
+            ", has_other_subs=" + std::to_string(has_other_subscribers) +
             ", supports_connected=" + std::to_string(supports_connected) + ")");
     }
 }

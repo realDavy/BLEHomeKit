@@ -48,6 +48,7 @@ static int s_adv_ensure_pass = 0;
 struct QueuedIndicate {
   uint16_t conn_id = 0;
   uint16_t attr_handle = 0;
+  uint8_t retries = 0;
   std::vector<uint8_t> data;
 };
 
@@ -59,23 +60,23 @@ static void clear_indicate_queue() {
   s_indicate_q.clear();
 }
 
-static bool start_indicate(uint16_t conn_id, uint16_t attr_handle,
-                           std::span<const uint8_t> data) {
+static int start_indicate(uint16_t conn_id, uint16_t attr_handle,
+                          std::span<const uint8_t> data) {
   static const uint8_t kEmpty = 0;
   const uint8_t *ptr = data.empty() ? &kEmpty : data.data();
   struct os_mbuf *om = ble_hs_mbuf_from_flat(ptr, data.size());
   if (om == nullptr) {
     ESP_LOGW(TAG, "indicate mbuf alloc failed attr=%u", attr_handle);
-    return false;
+    return BLE_HS_ENOMEM;
   }
   const int rc = ble_gatts_indicate_custom(conn_id, attr_handle, om);
   if (rc != 0) {
     ESP_LOGW(TAG, "indicate failed conn=%u attr=%u rc=%d", conn_id, attr_handle,
              rc);
-    return false;
+    return rc;
   }
   s_indicate_busy = true;
-  return true;
+  return 0;
 }
 
 static void flush_indicate_queue() {
@@ -83,8 +84,16 @@ static void flush_indicate_queue() {
   while (!s_indicate_q.empty()) {
     QueuedIndicate next = std::move(s_indicate_q.front());
     s_indicate_q.erase(s_indicate_q.begin());
-    if (start_indicate(next.conn_id, next.attr_handle, next.data)) {
+    const int rc =
+        start_indicate(next.conn_id, next.attr_handle, next.data);
+    if (rc == 0) {
       return;
+    }
+    // ENOENT/EAGAIN: CCCD or the ATT procedure is not ready yet. Try
+    // once more after the in-flight indicate finishes.
+    if (next.retries == 0 && (rc == BLE_HS_ENOENT || rc == BLE_HS_EAGAIN)) {
+      next.retries = 1;
+      s_indicate_q.push_back(std::move(next));
     }
   }
 }
@@ -629,12 +638,12 @@ bool Esp32Ble::send_indication(uint16_t connection_id,
         return true;
       }
     }
-    s_indicate_q.push_back(
-        QueuedIndicate{connection_id, attr_handle,
-                       std::vector<uint8_t>(data.begin(), data.end())});
+    s_indicate_q.push_back(QueuedIndicate{
+        connection_id, attr_handle, 0,
+        std::vector<uint8_t>(data.begin(), data.end())});
     return true;
   }
-  return start_indicate(connection_id, attr_handle, data);
+  return start_indicate(connection_id, attr_handle, data) == 0;
 }
 
 int Esp32Ble::gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
