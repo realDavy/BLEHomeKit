@@ -4,6 +4,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
+#include <host/ble_att.h>
 #include <nvs_flash.h>
 #include <services/gap/ble_svc_gap.h>
 #include <services/gatt/ble_svc_gatt.h>
@@ -31,6 +32,16 @@
 #include "setup_code.hpp"
 
 static const char* TAG = "HAP_LCDkit";
+
+class LcdkitBle : public Esp32Ble {
+public:
+    using Esp32Ble::Esp32Ble;
+
+    uint16_t att_mtu(uint16_t connection_id) const override {
+        const uint16_t mtu = ble_att_mtu(connection_id);
+        return mtu >= 23 ? mtu : 23;
+    }
+};
 
 static hap::AccessoryServer* s_server = nullptr;
 static std::shared_ptr<hap::core::Characteristic> s_on_char;
@@ -128,7 +139,7 @@ extern "C" void app_main() {
     static Esp32System system_impl;
     static Esp32Storage storage_impl;
     static Esp32Crypto crypto_impl;
-    static Esp32Ble ble_impl(&storage_impl);
+    static LcdkitBle ble_impl(&storage_impl);
 
     ble_svc_gap_init();
     ble_svc_gatt_init();

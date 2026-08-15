@@ -16,7 +16,7 @@ idf_component_register(
         "hap/src/transport/SecureSession.cpp"
         "hap/src/transport/Router.cpp"
         "hap/src/platform/Ble.cpp"
-        "hap/src/transport/BleTransport.cpp"
+        "BleTransport.cpp"  # local overlay: GATT read fragmentation + pair-setup timeout
         "hap/src/transport/ConnectionContext.cpp"
         "hap/src/transport/PairingEndpoints.cpp"
         "hap/src/transport/AccessoryEndpoints.cpp"
@@ -28,6 +28,7 @@ idf_component_register(
         "hap/src/types/CharacteristicTypes.cpp"
         "hap/src/types/ServiceTypes.cpp"
     INCLUDE_DIRS
+        "include_override"
         "hap/include"
     PRIV_REQUIRES
         johboh__nlohmann-json
