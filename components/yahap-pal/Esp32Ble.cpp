@@ -53,9 +53,45 @@ struct QueuedIndicate {
 };
 
 static bool s_indicate_busy = false;
+static int s_indicate_start_depth = 0;
 static std::vector<QueuedIndicate> s_indicate_q;
+static esp_timer_handle_t s_indicate_watchdog = nullptr;
+static bool s_restart_adv_after_conn_upd = false;
+static esp_timer_handle_t s_adv_after_conn_timer = nullptr;
+
+static void flush_indicate_queue();
+
+static void indicate_watchdog_stop() {
+  if (s_indicate_watchdog != nullptr) {
+    esp_timer_stop(s_indicate_watchdog);
+  }
+}
+
+static void indicate_watchdog_cb(void * /*arg*/) {
+  ESP_LOGW(TAG, "Indicate confirmation timed out; flushing queue");
+  flush_indicate_queue();
+}
+
+static void indicate_watchdog_arm() {
+  if (s_indicate_watchdog == nullptr) {
+    const esp_timer_create_args_t args = {
+        .callback = indicate_watchdog_cb,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "ind_wd",
+        .skip_unhandled_events = true,
+    };
+    if (esp_timer_create(&args, &s_indicate_watchdog) != ESP_OK) {
+      s_indicate_watchdog = nullptr;
+      return;
+    }
+  }
+  esp_timer_stop(s_indicate_watchdog);
+  esp_timer_start_once(s_indicate_watchdog, 800 * 1000);
+}
 
 static void clear_indicate_queue() {
+  indicate_watchdog_stop();
   s_indicate_busy = false;
   s_indicate_q.clear();
 }
@@ -69,23 +105,28 @@ static int start_indicate(uint16_t conn_id, uint16_t attr_handle,
     ESP_LOGW(TAG, "indicate mbuf alloc failed attr=%u", attr_handle);
     return BLE_HS_ENOMEM;
   }
+  // NimBLE posts BLE_GAP_EVENT_NOTIFY_TX status=0 from inside this call
+  // when the controller accepts the PDU. That is not the peer confirm.
+  ++s_indicate_start_depth;
   const int rc = ble_gatts_indicate_custom(conn_id, attr_handle, om);
+  --s_indicate_start_depth;
   if (rc != 0) {
     ESP_LOGW(TAG, "indicate failed conn=%u attr=%u rc=%d", conn_id, attr_handle,
              rc);
     return rc;
   }
   s_indicate_busy = true;
+  indicate_watchdog_arm();
   return 0;
 }
 
 static void flush_indicate_queue() {
+  indicate_watchdog_stop();
   s_indicate_busy = false;
   while (!s_indicate_q.empty()) {
     QueuedIndicate next = std::move(s_indicate_q.front());
     s_indicate_q.erase(s_indicate_q.begin());
-    const int rc =
-        start_indicate(next.conn_id, next.attr_handle, next.data);
+    const int rc = start_indicate(next.conn_id, next.attr_handle, next.data);
     if (rc == 0) {
       return;
     }
@@ -188,6 +229,54 @@ static void force_start_last_adv(const char *why) {
   s_force_adv_restart = true;
   const uint32_t interval = last_adv_interval != 0 ? last_adv_interval : 20;
   g_ble_instance->start_advertising(*last_adv, interval);
+}
+
+static void cancel_adv_after_conn() {
+  s_restart_adv_after_conn_upd = false;
+  if (s_adv_after_conn_timer != nullptr) {
+    esp_timer_stop(s_adv_after_conn_timer);
+  }
+}
+
+static void restart_adv_for_new_link(const char *why) {
+  if (s_ble_conns >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
+    ESP_LOGI(TAG, "Skip advertising (%s): at max links %u", why,
+             static_cast<unsigned>(s_ble_conns));
+    return;
+  }
+  force_start_last_adv(why);
+}
+
+static void adv_after_conn_cb(void * /*arg*/) {
+  if (!s_restart_adv_after_conn_upd) {
+    return;
+  }
+  s_restart_adv_after_conn_upd = false;
+  ESP_LOGI(TAG, "Starting advertising after connection-update wait");
+  restart_adv_for_new_link("after-conn-upd-timeout");
+}
+
+static void schedule_adv_after_conn() {
+  s_restart_adv_after_conn_upd = true;
+  if (s_adv_after_conn_timer == nullptr) {
+    const esp_timer_create_args_t args = {
+        .callback = adv_after_conn_cb,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "adv_conn",
+        .skip_unhandled_events = true,
+    };
+    if (esp_timer_create(&args, &s_adv_after_conn_timer) != ESP_OK) {
+      s_adv_after_conn_timer = nullptr;
+      ESP_LOGW(TAG, "Failed to create post-connect advertising timer; "
+                    "will start advertising on CONN_UPDATE");
+      return;
+    }
+  }
+  esp_timer_stop(s_adv_after_conn_timer);
+  // CONN_UPDATE usually arrives within one interval (~20–60 ms). This is
+  // only a fallback if the controller never emits the event.
+  esp_timer_start_once(s_adv_after_conn_timer, 400 * 1000);
 }
 
 static void log_adv_identity(const hap::platform::Ble::Advertisement &data) {
@@ -863,22 +952,43 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
           self->enc_adv_timer_ = nullptr;
         }
       }
-      // Keep advertising while connected so iPhone can come back immediately
-      // after this link drops (Home otherwise stays 未响应).
-      if (self && last_adv.has_value()) {
-        self->start_advertising(*last_adv, 20);
+      // Keep advertising while there is a free connection slot so a second
+      // controller can join. Do not start advertising in this same CONNECT
+      // callback as ble_gap_update_params — that races the controller
+      // (llc_con_upd.c assert) and returns BLE_HS_ENOMEM at max links.
+      if (s_ble_conns >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
+        cancel_adv_after_conn();
+        ESP_LOGI(TAG, "At max BLE links (%u); advertising after a drop",
+                 static_cast<unsigned>(s_ble_conns));
+      } else if (rc != 0) {
+        restart_adv_for_new_link("connect-no-upd");
+      } else {
+        schedule_adv_after_conn();
       }
     }
     break;
   case BLE_GAP_EVENT_NOTIFY_TX:
-    ESP_LOGD(TAG, "Indicate complete conn=%d status=%d",
-             event->notify_tx.conn_handle, event->notify_tx.status);
+    if (!event->notify_tx.indication) {
+      break;
+    }
+    // NimBLE delivers status=0 from inside ble_gatts_indicate_custom when
+    // the controller accepts the PDU. Flushing then started the next
+    // indicate before the peer confirmed. Wait for the later event.
+    if (s_indicate_start_depth > 0) {
+      ESP_LOGD(TAG, "Indicate queued conn=%d attr=%d status=%d",
+               event->notify_tx.conn_handle, event->notify_tx.attr_handle,
+               event->notify_tx.status);
+      break;
+    }
+    ESP_LOGI(TAG, "Indicate confirmed conn=%d attr=%d status=%d",
+             event->notify_tx.conn_handle, event->notify_tx.attr_handle,
+             event->notify_tx.status);
     flush_indicate_queue();
     break;
   case BLE_GAP_EVENT_ADV_COMPLETE:
     ESP_LOGW(TAG, "Advertising complete reason=%d; restarting",
              event->adv_complete.reason);
-    force_start_last_adv("adv-complete");
+    restart_adv_for_new_link("adv-complete");
     break;
   case BLE_GAP_EVENT_DISCONNECT:
     if (s_ble_conns > 0) {
@@ -887,6 +997,7 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
     ESP_LOGI(TAG, "Disconnected, reason=0x%x links=%u",
              event->disconnect.reason, static_cast<unsigned>(s_ble_conns));
     {
+      cancel_adv_after_conn();
       clear_indicate_queue();
       auto self = static_cast<Esp32Ble *>(arg);
       // Do not start advertising here. NimBLE is still cleaning up the
@@ -923,6 +1034,10 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
     break;
   case BLE_GAP_EVENT_CONN_UPDATE:
     ESP_LOGI(TAG, "Connection Update: conn=%d", event->conn_update.conn_handle);
+    if (s_restart_adv_after_conn_upd) {
+      cancel_adv_after_conn();
+      restart_adv_for_new_link("conn-update");
+    }
     break;
   case BLE_GAP_EVENT_CONN_UPDATE_REQ:
     ESP_LOGI(TAG, "Connection Update Request: conn=%d (accept)",

@@ -3,12 +3,13 @@
 // procedure timeout while waiting for the next pair-setup write,
 // keep SF=1 until Pair-Verify then push SF=0 immediately (Home scans
 // for the paired accessory while still connected), do not register an
-// empty 0xFE59 GATT service, increment GSN once per disconnected
-// period and once after a connected session with local changes
-// (HAP 7.4.6), coalesce Connected Events so a knob burst does not
-// outrun Home's indication+read, push current On/Brightness/CT as
-// soon as Pair-Verify and CCCDs are both ready (Home often
-// subscribes after Verify), do not treat a Home write as "still
+// empty 0xFE59 GATT service, send Connected Events immediately (NimBLE
+// coalesces in-flight indications by attr_handle and waits for the
+// peer confirm before the next ATT procedure), advertise one GSN per
+// disconnected knob burst and a separate hangup GSN so a later
+// gesture is not swallowed (HAP 7.4.6.1 vs 7.4.6.3), push current
+// On/Brightness/CT as soon as Pair-Verify
+// and CCCDs are both ready, do not treat a Home write as "still
 // pairing" just because the writer is the only subscriber, avoid
 // 500 ms advertising after drop, and disconnect after Home
 // RemovePairing so advertising returns to SF=1.
@@ -147,16 +148,19 @@ static uint16_t s_held_iids[8] = {};
 static uint8_t s_held_iid_count = 0;
 static bool s_gsn_cached = false;
 static uint16_t s_cached_gsn = 1;
-// HAP 7.4.6.3: one GSN bump while disconnected, until a controller connects.
-static bool s_gsn_dirty_disconnected = false;
 // HAP 7.4.6.1: first connected-session change is advertised after hangup.
 static bool s_gsn_pending_on_disconnect = false;
-static uint16_t s_pending_connected_iids[8] = {};
-static uint8_t s_pending_connected_count = 0;
-static bool s_connected_flush_scheduled = false;
-static hap::common::TaskScheduler::TaskId s_connected_flush_task =
+// One GSN per disconnected knob burst. The burst closes 150 ms after the
+// last detent so the next gesture can advertise a new GSN. A sticky
+// "until Home connects" flag swallowed every later turn in the field logs.
+static bool s_disconnect_burst_open = false;
+static hap::common::TaskScheduler* s_disconnect_burst_scheduler = nullptr;
+static hap::common::TaskScheduler::TaskId s_disconnect_burst_task =
     hap::common::TaskScheduler::INVALID_TASK_ID;
-static constexpr uint32_t kConnectedEventCoalesceMs = 100;
+static hap::common::TaskScheduler::TaskId s_hangup_gsn_task =
+    hap::common::TaskScheduler::INVALID_TASK_ID;
+static bool s_gsn_bumped_since_disconnect = false;
+static constexpr uint32_t kDisconnectBurstGapMs = 150;
 
 static void hap_remember_iid(uint16_t* iids, uint8_t& count, uint16_t iid) {
     for (uint8_t i = 0; i < count; ++i) {
@@ -177,22 +181,22 @@ static void hap_clear_held_iids() {
     s_held_iid_count = 0;
 }
 
-static void hap_remember_connected_iid(uint16_t iid) {
-    hap_remember_iid(s_pending_connected_iids, s_pending_connected_count, iid);
+static void hap_cancel_task(hap::common::TaskScheduler::TaskId& id) {
+    if (s_disconnect_burst_scheduler &&
+        id != hap::common::TaskScheduler::INVALID_TASK_ID) {
+        s_disconnect_burst_scheduler->cancel(id);
+    }
+    id = hap::common::TaskScheduler::INVALID_TASK_ID;
 }
 
-static void hap_clear_pending_connected(hap::common::TaskScheduler* scheduler) {
-    if (scheduler && s_connected_flush_task != hap::common::TaskScheduler::INVALID_TASK_ID) {
-        scheduler->cancel(s_connected_flush_task);
-    }
-    s_connected_flush_task = hap::common::TaskScheduler::INVALID_TASK_ID;
-    s_connected_flush_scheduled = false;
-    s_pending_connected_count = 0;
+static void hap_close_disconnect_burst() {
+    hap_cancel_task(s_disconnect_burst_task);
+    hap_cancel_task(s_hangup_gsn_task);
+    s_disconnect_burst_open = false;
 }
 
 static void hap_note_controller_connected() {
-    // Home already consumed the disconnected GSN by connecting.
-    s_gsn_dirty_disconnected = false;
+    hap_close_disconnect_burst();
 }
 
 static bool hap_session_encrypted(hap::transport::ble::BleSessionManager* sessions) {
@@ -230,7 +234,6 @@ static void hap_schedule_controller_refresh(hap::common::TaskScheduler* schedule
             break; \
         } \
         hap_note_controller_connected(); \
-        hap_clear_pending_connected(config_.scheduler); \
         int sent = 0; \
         for (const auto& [key, uuid] : instance_map_) { \
             if (!session_manager_->has_subscribers(uuid)) { \
@@ -308,7 +311,8 @@ void BleTransport::start() {
             write_already_bumped_gsn = session->transaction.gsn_incremented;
         }
         session_manager_->remove(connection_id);
-        hap_clear_pending_connected(config_.scheduler);
+        hap_close_disconnect_burst();
+        s_gsn_bumped_since_disconnect = false;
         // Held knob changes never made it out as indications.
         const bool undelivered_local = s_pending_state_push || (s_held_iid_count > 0);
         hap_clear_held_iids();
@@ -322,6 +326,9 @@ void BleTransport::start() {
         // HAP 7.4.6.1: after the first connected-session change, increment
         // GSN once and put it in the post-disconnect advertisement. Also
         // covers Add Accessory hangup and Pair-Verify that never finished.
+        // Do not open a disconnected-event burst here: 7.4.6.3 gestures
+        // after hangup must get their own GSN. Home ignored the hangup
+        // bump in field logs; coalescing later turns into it swallowed them.
         const bool need_gsn = s_gsn_on_first_verify_drop ||
                               ((!write_already_bumped_gsn) &&
                                (s_gsn_pending_on_disconnect || undelivered_local));
@@ -329,10 +336,20 @@ void BleTransport::start() {
         s_gsn_pending_on_disconnect = false;
         // Wait until Esp32Ble has restarted advertising (100 ms) so this
         // does not fight NimBLE connection teardown.
-        if (need_gsn && !s_gsn_dirty_disconnected) {
-            s_gsn_dirty_disconnected = true;
+        s_disconnect_burst_scheduler = config_.scheduler;
+        if (need_gsn) {
             if (config_.scheduler) {
-                config_.scheduler->schedule_once(150, [this]() { increment_gsn(); });
+                s_hangup_gsn_task = config_.scheduler->schedule_once(150, [this]() {
+                    s_hangup_gsn_task = hap::common::TaskScheduler::INVALID_TASK_ID;
+                    if (s_gsn_bumped_since_disconnect) {
+                        config_.system->log(platform::System::LogLevel::Info,
+                            "[BleTransport] Skip hangup GSN; disconnected event already advertised a new GSN");
+                        return;
+                    }
+                    config_.system->log(platform::System::LogLevel::Info,
+                        "[BleTransport] Hangup GSN bump (HAP 7.4.6.1)");
+                    increment_gsn();
+                });
             } else {
                 increment_gsn();
             }
@@ -752,7 +769,7 @@ void BleTransport::increment_gsn() {
     };
     config_.storage->set("gsn", gsn_data);
     
-    config_.system->log(platform::System::LogLevel::Debug, 
+    config_.system->log(platform::System::LogLevel::Info, 
         "[BleTransport] GSN incremented to " + std::to_string(gsn));
 }
 
@@ -2136,38 +2153,9 @@ void BleTransport::handle_characteristic_change(uint64_t aid, uint64_t iid,
         s_exclude_conn_id = exclude_conn_id;
         hap_note_controller_connected();
         s_gsn_pending_on_disconnect = true;
-        hap_remember_connected_iid(static_cast<uint16_t>(iid));
-        if (s_connected_flush_scheduled) {
-            config_.system->log(platform::System::LogLevel::Debug,
-                "[BleTransport] Coalesce Connected Event IID=" + std::to_string(iid));
-        } else if (config_.scheduler) {
-            s_connected_flush_scheduled = true;
-            s_connected_flush_task = config_.scheduler->schedule_once(
-                kConnectedEventCoalesceMs, [this]() {
-                    s_connected_flush_scheduled = false;
-                    s_connected_flush_task = hap::common::TaskScheduler::INVALID_TASK_ID;
-                    const uint8_t n = s_pending_connected_count;
-                    uint16_t iids[8];
-                    for (uint8_t i = 0; i < n; ++i) {
-                        iids[i] = s_pending_connected_iids[i];
-                    }
-                    s_pending_connected_count = 0;
-                    for (uint8_t i = 0; i < n; ++i) {
-                        config_.system->log(platform::System::LogLevel::Info,
-                            "[BleTransport] Sending Connected Event for IID=" +
-                            std::to_string(iids[i]));
-                        send_connected_event(iids[i]);
-                    }
-                });
-            config_.system->log(platform::System::LogLevel::Debug,
-                "[BleTransport] Connected Event IID=" + std::to_string(iid) +
-                " queued (" + std::to_string(kConnectedEventCoalesceMs) + " ms)");
-        } else {
-            config_.system->log(platform::System::LogLevel::Info,
-                "[BleTransport] Sending Connected Event for IID=" + std::to_string(iid));
-            send_connected_event(static_cast<uint16_t>(iid));
-            s_pending_connected_count = 0;
-        }
+        config_.system->log(platform::System::LogLevel::Info,
+            "[BleTransport] Sending Connected Event for IID=" + std::to_string(iid));
+        send_connected_event(static_cast<uint16_t>(iid));
         s_exclude_conn_id = UINT32_MAX;
     }
     else if (encrypted && from_controller) {
@@ -2292,19 +2280,38 @@ void BleTransport::send_broadcasted_event(uint16_t iid, const core::Value& value
 }
 
 void BleTransport::send_disconnected_event(uint16_t iid) {
-    // HAP 7.4.6.3: increment GSN once for all disconnected changes until
-    // a controller connects. Further knob steps keep the latest values in
-    // the database; Pair-Verify push / a later read picks them up.
-    if (s_gsn_dirty_disconnected) {
-        config_.system->log(platform::System::LogLevel::Debug,
-            "[BleTransport] Coalesced Disconnected Event for IID=" + std::to_string(iid) +
-            " (GSN already advertised)");
-        return;
+    // Leading GSN for this knob burst so Home starts connecting immediately.
+    // 150 ms after the last detent the burst closes; the next gesture gets
+    // a new GSN. Do not keep the burst open until a controller connects —
+    // Home ignored the hangup GSN in field logs and then never came back.
+    s_disconnect_burst_scheduler = config_.scheduler;
+    if (s_disconnect_burst_scheduler &&
+        s_disconnect_burst_task != hap::common::TaskScheduler::INVALID_TASK_ID) {
+        s_disconnect_burst_scheduler->cancel(s_disconnect_burst_task);
+        s_disconnect_burst_task = hap::common::TaskScheduler::INVALID_TASK_ID;
     }
-    s_gsn_dirty_disconnected = true;
-    config_.system->log(platform::System::LogLevel::Info,
-        "[BleTransport] Disconnected Event for IID=" + std::to_string(iid));
-    increment_gsn();
+
+    if (!s_disconnect_burst_open) {
+        s_disconnect_burst_open = true;
+        s_gsn_bumped_since_disconnect = true;
+        config_.system->log(platform::System::LogLevel::Info,
+            "[BleTransport] Disconnected Event for IID=" + std::to_string(iid));
+        increment_gsn();
+    } else {
+        config_.system->log(platform::System::LogLevel::Info,
+            "[BleTransport] Disconnected Event for IID=" + std::to_string(iid) +
+            " coalesced into current burst");
+    }
+
+    if (s_disconnect_burst_scheduler) {
+        s_disconnect_burst_task = s_disconnect_burst_scheduler->schedule_once(
+            kDisconnectBurstGapMs, []() {
+                s_disconnect_burst_task = hap::common::TaskScheduler::INVALID_TASK_ID;
+                s_disconnect_burst_open = false;
+            });
+    } else {
+        s_disconnect_burst_open = false;
+    }
 }
 
 std::vector<uint8_t> BleTransport::build_encrypted_advertisement_payload(uint16_t iid, const core::Value& value) {
