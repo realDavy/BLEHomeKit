@@ -165,8 +165,9 @@ extern "C" void app_main() {
     static Esp32Crypto crypto_impl;
     static LcdkitBle ble_impl(&storage_impl);
 
-    // Leftover pairing_list (even "null" / incomplete JSON) makes HAP advertise
-    // SF=0, so Home will not show this as a new accessory. Sanitize before start.
+    // Leftover or incomplete pairing_list makes HAP advertise SF=0, so Home
+    // will not show this as a new accessory. Sanitize before start. Pair-Setup
+    // without Pair-Verify still advertises SF=1 so Add Accessory can finish.
     if (hap_encoder_sw_held(1500)) {
         ESP_LOGW(TAG, "Encoder held at boot: clearing HomeKit pairings");
         hap_clear_controller_pairings(storage_impl);

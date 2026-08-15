@@ -1,20 +1,26 @@
 // Local overlay of hap/src/transport/BleTransport.cpp:
-// fragment HAP-BLE GATT reads to ATT MTU, and do not apply the 10s
-// procedure timeout while waiting for the next pair-setup write.
+// fragment HAP-BLE GATT reads to ATT MTU, do not apply the 10s
+// procedure timeout while waiting for the next pair-setup write,
+// keep SF=1 until Pair-Verify, and do not register an empty 0xFE59 GATT service.
 #include "hap/transport/BleTransport.hpp"
 #include "hap/core/CharacteristicFinder.hpp"
 #include "hap/core/HAPStatus.hpp"
+#include "hap/platform/Storage.hpp"
+#include "hap/platform/System.hpp"
+#include <cstdint>
 #include <random>
 #include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <optional>
 #include <string>
+#include <vector>
 #include "hap/core/TLV8.hpp"
 #include "hap/transport/ble/BleTlvBuilder.hpp"
 #include "hap/core/CharacteristicSerializer.hpp"
 
 static bool s_adv_dirty = false;
+static constexpr const char* kPairVerifiedKey = "pair_verified";
 
 static bool hap_list_means_paired(hap::platform::Storage* storage) {
     if (!storage) {
@@ -26,6 +32,52 @@ static bool hap_list_means_paired(hap::platform::Storage* storage) {
     }
     std::string s(pairing_list->begin(), pairing_list->end());
     return !s.empty() && s.front() == '[' && s.back() == ']' && s != "[]";
+}
+
+// Home's Add Accessory flow disconnects after Pair-Setup and scans again.
+// Advertising SF=0 at that moment makes iOS treat the accessory as already
+// in a Home and fail with "Discovery failed". Keep SF=1 until Pair-Verify.
+static bool hap_should_advertise_paired(hap::platform::Storage* storage) {
+    if (!hap_list_means_paired(storage)) {
+        return false;
+    }
+    auto verified = storage->get(kPairVerifiedKey);
+    if (!verified || verified->empty()) {
+        // Pairings written before this flag existed already finished Add Accessory.
+        return true;
+    }
+    return (*verified)[0] == '1';
+}
+
+static void hap_note_pair_setup_saved(hap::platform::Storage* storage, hap::platform::System* system) {
+    if (!hap_list_means_paired(storage)) {
+        return;
+    }
+    auto verified = storage->get(kPairVerifiedKey);
+    if (verified && !verified->empty() && (*verified)[0] == '0') {
+        return;
+    }
+    storage->set(kPairVerifiedKey, std::vector<uint8_t>{'0'});
+    if (system) {
+        system->log(hap::platform::System::LogLevel::Info,
+            "[BleTransport] Pair-Setup saved controller; keep SF=1 until Pair Verify");
+    }
+}
+
+static void hap_note_pair_verify_done(hap::platform::Storage* storage, hap::platform::System* system,
+                                     bool encrypted) {
+    if (!encrypted || !storage) {
+        return;
+    }
+    auto verified = storage->get(kPairVerifiedKey);
+    if (verified && !verified->empty() && (*verified)[0] == '1') {
+        return;
+    }
+    storage->set(kPairVerifiedKey, std::vector<uint8_t>{'1'});
+    if (system) {
+        system->log(hap::platform::System::LogLevel::Info,
+            "[BleTransport] Pair-Verify succeeded; next advertisement uses SF=0");
+    }
 }
 
 static std::string to_hex_string(const uint8_t* data, size_t len) {
@@ -80,15 +132,8 @@ void BleTransport::start() {
     
     setup_hap_service();
 
-    // iPhone also looks for the Bluetooth SIG HAP service 0xFE59 after connect.
-    {
-        platform::Ble::ServiceDefinition fe59;
-        fe59.uuid = "FE59";
-        fe59.is_primary = true;
-        config_.ble->register_service(fe59);
-        config_.system->log(platform::System::LogLevel::Info,
-            "[BleTransport] Registered HAP service UUID 0xFE59");
-    }
+    // 0xFE59 belongs in advertisements only. An empty GATT service with that
+    // UUID makes Home treat HAP as having no characteristics ("Discovery failed").
     
     register_user_services();
     
@@ -409,7 +454,7 @@ void BleTransport::update_advertising() {
     uint8_t setup_hash[4];
     std::copy_n(hash_output.begin(), 4, setup_hash);
     
-    uint8_t status_flags = hap_list_means_paired(config_.storage) ? 0x00 : 0x01;
+    uint8_t status_flags = hap_should_advertise_paired(config_.storage) ? 0x00 : 0x01;
     
     uint8_t device_id[6] = {0};
     int scanned = sscanf(config_.accessory_id.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
@@ -459,7 +504,8 @@ void BleTransport::update_advertising() {
         "[BleTransport] SF=" + std::to_string(status_flags) + 
         " ACID=" + std::to_string(config_.category_id) +
         " GSN=" + std::to_string(gsn) +
-        " CN=" + std::to_string(config_number));
+        " CN=" + std::to_string(config_number) +
+        (status_flags ? " (pairable)" : " (paired)"));
 
     config_.ble->start_advertising(adv, 20);
 }
@@ -931,9 +977,11 @@ void BleTransport::process_transaction(uint16_t connection_id, TransactionState&
              if (type == 0x4C) { // Pair Setup
                 req.path = "/pair-setup";
                 resp = config_.pairing_endpoints->handle_pair_setup(req, ctx);
+                hap_note_pair_setup_saved(config_.storage, config_.system);
              } else if (type == 0x4E) { // Pair Verify
                 req.path = "/pair-verify";
                 resp = config_.pairing_endpoints->handle_pair_verify(req, ctx);
+                hap_note_pair_verify_done(config_.storage, config_.system, ctx.is_encrypted());
              } else if (type == 0x50) { // Pairings
                 req.path = "/pairings";
                 resp = config_.pairing_endpoints->handle_pairings(req, ctx);
@@ -1133,9 +1181,11 @@ void BleTransport::process_transaction(uint16_t connection_id, TransactionState&
                 if (type == 0x4C) {
                     req.path = "/pair-setup";
                     resp = config_.pairing_endpoints->handle_pair_setup(req, ctx);
+                    hap_note_pair_setup_saved(config_.storage, config_.system);
                 } else if (type == 0x4E) {
                     req.path = "/pair-verify";
                     resp = config_.pairing_endpoints->handle_pair_verify(req, ctx);
+                    hap_note_pair_verify_done(config_.storage, config_.system, ctx.is_encrypted());
                 } else if (type == 0x50) {
                     req.path = "/pairings";
                     resp = config_.pairing_endpoints->handle_pairings(req, ctx);
@@ -1443,6 +1493,7 @@ bool BleTransport::process_characteristic_write(uint16_t connection_id, uint16_t
         req.path = "/pair-setup";
         
         auto resp = config_.pairing_endpoints->handle_pair_setup(req, *session.context);
+        hap_note_pair_setup_saved(config_.storage, config_.system);
         
         uint8_t status = (resp.status == Status::OK) ? 0x00 : 0x05; 
         send_response(connection_id, tid, uuid, status, resp.body);
@@ -1455,6 +1506,7 @@ bool BleTransport::process_characteristic_write(uint16_t connection_id, uint16_t
         req.path = "/pair-verify";
         
         auto resp = config_.pairing_endpoints->handle_pair_verify(req, *session.context);
+        hap_note_pair_verify_done(config_.storage, config_.system, session.context->is_encrypted());
         uint8_t status = (resp.status == Status::OK) ? 0x00 : 0x05;
         send_response(connection_id, tid, uuid, status, resp.body);
         return true;
@@ -1940,7 +1992,7 @@ void BleTransport::send_disconnected_event(uint16_t iid) {
     uint8_t setup_hash[4];
     std::copy_n(hash_output.begin(), 4, setup_hash);
     
-    uint8_t status_flags = hap_list_means_paired(config_.storage) ? 0x00 : 0x01;
+    uint8_t status_flags = hap_should_advertise_paired(config_.storage) ? 0x00 : 0x01;
     
     uint8_t device_id[6] = {0};
     sscanf(config_.accessory_id.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",

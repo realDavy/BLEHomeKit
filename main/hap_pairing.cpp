@@ -128,6 +128,7 @@ void hap_clear_controller_pairings(hap::platform::Storage& storage) {
         storage.remove("pairing_list");
     }
     storage.remove("gsn");
+    storage.remove("pair_verified");
     ESP_LOGW(TAG, "Cleared HomeKit controller pairings (identity kept)");
 }
 
@@ -163,7 +164,14 @@ bool hap_sanitize_pairings(hap::platform::Storage& storage) {
         return false;
     }
 
-    ESP_LOGI(TAG, "HAP pairings: %u valid controller(s) (SF=0)",
-             static_cast<unsigned>(ids.size()));
-    return true;
+    auto verified = storage.get("pair_verified");
+    const bool advertise_paired = !verified || verified->empty() || (*verified)[0] == '1';
+    if (!verified || verified->empty()) {
+        // Legacy pairing already completed Add Accessory before this flag existed.
+        storage.set("pair_verified", std::vector<uint8_t>{'1'});
+    }
+    ESP_LOGI(TAG, "HAP pairings: %u valid controller(s) (%s)",
+             static_cast<unsigned>(ids.size()),
+             advertise_paired ? "SF=0 after Pair Verify" : "SF=1 until Pair Verify");
+    return advertise_paired;
 }

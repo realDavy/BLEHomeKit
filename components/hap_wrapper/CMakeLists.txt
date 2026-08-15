@@ -16,7 +16,7 @@ idf_component_register(
         "hap/src/transport/SecureSession.cpp"
         "hap/src/transport/Router.cpp"
         "hap/src/platform/Ble.cpp"
-        "BleTransport.cpp"  # local overlay: GATT read fragmentation + pair-setup timeout
+        "BleTransport.cpp"  # overlay: GATT fragments, SF until Pair-Verify, no empty FE59 GATT
         "hap/src/transport/ConnectionContext.cpp"
         "hap/src/transport/PairingEndpoints.cpp"
         "hap/src/transport/AccessoryEndpoints.cpp"
