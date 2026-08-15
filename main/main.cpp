@@ -135,6 +135,7 @@ extern "C" void app_main() {
         nvs_ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(nvs_ret);
+    hap_wipe_legacy_nvs();
 
     if (sodium_init() < 0) {
         ESP_LOGE(TAG, "sodium_init failed");

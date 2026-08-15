@@ -5,6 +5,8 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
 #include <algorithm>
 #include <cctype>
@@ -94,6 +96,69 @@ bool hap_encoder_sw_held(int hold_ms) {
     return true;
 }
 
+static bool hap_nvs_has_pairing_list() {
+    nvs_handle_t handle;
+    if (nvs_open("hap_storage", NVS_READONLY, &handle) != ESP_OK) {
+        return false;
+    }
+    size_t len = 0;
+    const esp_err_t err = nvs_get_blob(handle, "pairing_list", nullptr, &len);
+    nvs_close(handle);
+    return err == ESP_OK && len > 0;
+}
+
+static void hap_nvs_erase_hap_storage() {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("hap_storage", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "hap_storage open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    err = nvs_erase_all(handle);
+    ESP_LOGW(TAG, "nvs_erase_all(hap_storage)=%s", esp_err_to_name(err));
+    err = nvs_commit(handle);
+    ESP_LOGW(TAG, "nvs_commit(hap_storage)=%s", esp_err_to_name(err));
+    nvs_close(handle);
+}
+
+void hap_wipe_legacy_nvs() {
+    const bool had_list = hap_nvs_has_pairing_list();
+    ESP_LOGW(TAG, "hap_wipe: pairing_list %s", had_list ? "PRESENT" : "absent");
+
+    nvs_handle_t boot;
+    if (nvs_open("hap_boot", NVS_READWRITE, &boot) != ESP_OK) {
+        ESP_LOGE(TAG, "hap_boot open failed");
+        if (had_list) {
+            hap_nvs_erase_hap_storage();
+        }
+        return;
+    }
+
+    uint8_t wipe3 = 0;
+    nvs_get_u8(boot, "wipe3", &wipe3);
+
+    if (had_list && wipe3 != 1) {
+        ESP_LOGW(TAG, "Wiping hap_storage (wipe3) so HomeKit advertises SF=1");
+        hap_nvs_erase_hap_storage();
+        if (hap_nvs_has_pairing_list()) {
+            ESP_LOGE(TAG, "pairing_list STILL present after nvs_erase_all");
+        } else {
+            ESP_LOGW(TAG, "pairing_list removed; advertising should be SF=1");
+            nvs_set_u8(boot, "wipe3", 1);
+            nvs_commit(boot);
+        }
+    } else if (had_list) {
+        ESP_LOGI(TAG, "Keeping HomeKit pairing (wipe3 already done)");
+    } else {
+        ESP_LOGI(TAG, "No NVS pairing_list (SF=1)");
+        if (wipe3 != 1) {
+            nvs_set_u8(boot, "wipe3", 1);
+            nvs_commit(boot);
+        }
+    }
+    nvs_close(boot);
+}
+
 void hap_clear_controller_pairings(hap::platform::Storage& storage) {
     auto list = storage.get("pairing_list");
     if (list && !list->empty()) {
@@ -111,16 +176,6 @@ void hap_clear_controller_pairings(hap::platform::Storage& storage) {
 }
 
 bool hap_sanitize_pairings(hap::platform::Storage& storage) {
-    // v1 used Storage::has(), which can miss an existing pairing_list and
-    // still write the marker. v2 always reads the marker with get() and
-    // clears pairings once so Home can discover this accessory (SF=1).
-    if (!storage.get("clr_pair_v2")) {
-        ESP_LOGW(TAG, "One-time clear of leftover HomeKit pairings (SF=1)");
-        hap_clear_controller_pairings(storage);
-        const uint8_t mark[] = {1};
-        storage.set("clr_pair_v2", mark);
-    }
-
     auto list = storage.get("pairing_list");
     if (!list || list->empty()) {
         ESP_LOGI(TAG, "HAP pairings: none (SF=1)");

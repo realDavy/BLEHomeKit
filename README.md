@@ -88,7 +88,7 @@ idf.py set-target esp32c3
 
 若已经能发现配件但配对在 Pair Setup M2 后断开：旧代码会一次 GATT Read 返回约 418 字节，超过 ATT MTU 256。新固件应打印 `Returning 253/418 bytes` 这类分片。配对码以屏幕和串口打印的 `XXX-XX-XXX` 为准。
 
-若串口是 `Advertising started` 且 `SF=0`，家庭 App **不会**把它当成新配件。这是 NVS 里残留的 `pairing_list`。烧录后第一次启动应打印 `One-time clear of leftover HomeKit pairings` 并广播 `SF=1`。之后再配对会保留。仍显示已配对时：
+若串口是 `Advertising started` 且 `SF=0`，家庭 App **不会**把它当成新配件。这是 NVS 里残留的 `pairing_list`。烧录后第一次启动应打印 `Wiping hap_storage (wipe3)` 和 `SF=1`。之后再配对会保留。仍显示已配对时：
 
 - 长按旋钮 3 秒，或
 - **上电时按住旋钮约 1.5 秒**，或
