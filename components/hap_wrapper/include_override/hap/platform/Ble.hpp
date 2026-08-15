@@ -47,6 +47,9 @@ struct Ble {
 
     virtual void start() = 0;
 
+    /** Number of live BLE links (before HAP Pair-Verify). */
+    virtual uint16_t active_connections() const { return 0; }
+
     /**
      * @brief Start BLE advertising with the given data.
      * @param data The advertisement payload and configuration.

@@ -39,6 +39,7 @@ static std::optional<Esp32Ble::Advertisement> pending_adv;
 static std::optional<Esp32Ble::Advertisement> last_adv;
 static uint32_t pending_adv_interval = 0;
 static uint32_t last_adv_interval = 20;
+static uint16_t s_ble_conns = 0;
 
 struct QueuedIndicate {
   uint16_t conn_id = 0;
@@ -279,6 +280,8 @@ Esp32Ble::Esp32Ble(hap::platform::Storage *storage) : storage_(storage) {
   ble_hs_cfg.sm_mitm = 0;
   ble_hs_cfg.sm_sc = 0;
 }
+
+uint16_t Esp32Ble::active_connections() const { return s_ble_conns; }
 
 void Esp32Ble::start() {
   nimble_port_freertos_init([](void *arg) {
@@ -748,7 +751,11 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
         }
         break;
       }
-      ESP_LOGI(TAG, "Connected handle=%d", event->connect.conn_handle);
+      if (s_ble_conns < 0xFFFF) {
+        ++s_ble_conns;
+      }
+      ESP_LOGI(TAG, "Connected handle=%d links=%u", event->connect.conn_handle,
+               static_cast<unsigned>(s_ble_conns));
       struct ble_gap_conn_desc desc;
       if (ble_gap_conn_find(event->connect.conn_handle, &desc) == 0) {
         ESP_LOGI(TAG,
@@ -796,7 +803,11 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
     flush_indicate_queue();
     break;
   case BLE_GAP_EVENT_DISCONNECT:
-    ESP_LOGI(TAG, "Disconnected, reason=0x%x", event->disconnect.reason);
+    if (s_ble_conns > 0) {
+      --s_ble_conns;
+    }
+    ESP_LOGI(TAG, "Disconnected, reason=0x%x links=%u",
+             event->disconnect.reason, static_cast<unsigned>(s_ble_conns));
     {
       clear_indicate_queue();
       auto self = static_cast<Esp32Ble *>(arg);
@@ -832,6 +843,10 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
   case BLE_GAP_EVENT_CONN_UPDATE:
     ESP_LOGI(TAG, "Connection Update: conn=%d", event->conn_update.conn_handle);
     break;
+  case BLE_GAP_EVENT_CONN_UPDATE_REQ:
+    ESP_LOGI(TAG, "Connection Update Request: conn=%d (accept)",
+             event->conn_update_req.conn_handle);
+    return 0;
   case BLE_GAP_EVENT_ENC_CHANGE:
     ESP_LOGI(TAG, "Encryption Change: conn=%d status=%d",
              event->enc_change.conn_handle, event->enc_change.status);

@@ -29,6 +29,7 @@ public:
                                    uint32_t interval_ms,
                                    uint32_t duration_ms) override;
   void start() override;
+  uint16_t active_connections() const override;
 
 private:
   static int ble_gap_event(struct ble_gap_event *event, void *arg);

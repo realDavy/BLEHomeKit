@@ -1990,7 +1990,9 @@ void BleTransport::handle_characteristic_change(uint64_t aid, uint64_t iid,
         }
     }
     
-    is_connected_ = session_manager_->session_count() > 0;
+    const uint16_t radio_links =
+        config_.ble ? config_.ble->active_connections() : 0;
+    is_connected_ = session_manager_->session_count() > 0 || radio_links > 0;
     
     if (is_connected_ && has_connected_subscribers && supports_connected) {
         s_exclude_conn_id = exclude_conn_id;
@@ -2006,6 +2008,13 @@ void BleTransport::handle_characteristic_change(uint64_t aid, uint64_t iid,
     }
     else if (!is_connected_ && supports_disconnected) {
         send_disconnected_event(static_cast<uint16_t>(iid));
+    }
+    else if (radio_links > 0) {
+        // BLE is up but Pair-Verify / indicate subscribe is not done.
+        // Bumping GSN here makes Home stay on 正在更新.
+        config_.system->log(platform::System::LogLevel::Info,
+            "[BleTransport] Hold event IID=" + std::to_string(iid) +
+            " until controller finishes Pair-Verify");
     }
     else {
         config_.system->log(platform::System::LogLevel::Debug,
