@@ -25,4 +25,4 @@
 // Color temperature presets matching knob_panel warm / cool.
 #define LIGHT_COOL_MIREDS      154u   // ~6500 K
 #define LIGHT_WARM_MIREDS      370u   // ~2700 K
-#define LIGHT_PWM_STEP         10
+#define LIGHT_PWM_STEP         5
