@@ -378,10 +378,7 @@ void BleTransport::update_advertising() {
     uint8_t setup_hash[4];
     std::copy_n(hash_output.begin(), 4, setup_hash);
     
-    auto pairing_list = config_.storage->get("pairing_list");
-    (void)pairing_list;
     // Always advertise unpaired so Home can find this accessory.
-    const bool is_paired = false;
     uint8_t status_flags = 0x01;
     
     uint8_t device_id[6] = {0};
@@ -434,7 +431,7 @@ void BleTransport::update_advertising() {
         " GSN=" + std::to_string(gsn) +
         " CN=" + std::to_string(config_number));
 
-    config_.ble->start_advertising(adv, config_.ble->interval_config.normal_interval_ms);
+    config_.ble->start_advertising(adv, 20);
 }
 
 void BleTransport::set_accessory_id(const std::string& new_id) {
@@ -1913,10 +1910,7 @@ void BleTransport::send_disconnected_event(uint16_t iid) {
     uint8_t setup_hash[4];
     std::copy_n(hash_output.begin(), 4, setup_hash);
     
-    auto pairing_list = config_.storage->get("pairing_list");
-    (void)pairing_list;
     // Always advertise unpaired so Home can find this accessory.
-    const bool is_paired = false;
     uint8_t status_flags = 0x01;
     
     uint8_t device_id[6] = {0};

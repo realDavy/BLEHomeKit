@@ -1,0 +1,87 @@
+menu "YAHAP-PAL"
+
+config PAL_ESPHOME
+  bool "Enable ESPHome support"
+  default n
+  help 
+      Skips mDNS initialization and doesn't set the hostname and instance name 
+
+config PAL_CRYPTO_HKDF
+    bool "Enable HKDF"
+    default y
+    select MBEDTLS_HKDF_C
+
+config PAL_BLE_ENABLED
+    bool "Enable BLE support"
+    default y
+    depends on BT_ENABLED && BT_NIMBLE_ENABLED
+
+config PAL_NETWORK_ENABLED
+    bool "Enable IP support (WiFi)"
+    default y
+    depends on LWIP_ENABLE && LWIP_IPV4 && ESP_NETIF_TCPIP_LWIP
+
+
+  menu "iTWT Configuration"
+      config TWT_ENABLE_KEEP_ALIVE_QOS_NULL
+          bool "enable TWT keep alive qos null"
+          default n
+          help 
+              Enable send QOS NULL to keep alive during TWT.
+      config ITWT_TRIGGER_ENABLE
+          bool "trigger-enabled"
+          default y
+          help
+              0- a non-trigger-enabled TWT, 1-a trigger-enabled TWT
+
+      config ITWT_ANNOUNCED
+          bool "announced"
+          default y
+          help
+              0- an unannounced TWT, 1-an announced TWT
+
+      config ITWT_MIN_WAKE_DURA
+          int "itwt minimum wake duration"
+          range 1 255
+          default 255
+          help
+              Nominal Minimum Wake Duration, indicates the minimum amount of time, in unit of 256 us, that the TWT
+              requesting STA expects that it needs to be awake. The value range is [1, 255].
+
+      config ITWT_WAKE_DURATION_UNIT
+          int "itwt wake duration unit"
+          range 0 1
+          default 0
+          help
+              TWT wake duration unit, 0: 256us 1: TU (TU = 1024us)
+
+      config ITWT_WAKE_INVL_EXPN
+          int "itwt wake interval exponent"
+          range 0 31
+          default 10
+          help
+              TWT Wake Interval Exponent, in microseconds. The value range is [0, 31].
+
+      config ITWT_WAKE_INVL_MANT
+          int "itwt wake interval mantissa"
+          range 1 65535
+          default 512
+          help
+              TWT Wake Interval Mantissa, in microseconds. The value range is [1, 65535].
+
+      config ITWT_ID
+          int "itwt connection id"
+          range 0 32767
+          default 0
+          help
+              TWT Connection id. The value range is [0, 32767].
+
+      config ITWT_SETUP_TIMEOUT_TIME_MS
+          int "itwt setup timeout times"
+          range 100 65535
+          default 5000
+          help
+              TWT setup timeout time, in microseconds. The value range is [100, 65535].
+
+  endmenu
+endmenu

@@ -141,8 +141,11 @@ void hap_wipe_legacy_nvs() {
 
     const esp_err_t e1 = nvs_erase_key(handle, "pairing_list");
     const esp_err_t e2 = nvs_erase_key(handle, "gsn");
-    ESP_LOGW(TAG, "Boot unpair: erase pairing_list=%s gsn=%s",
-             esp_err_to_name(e1), esp_err_to_name(e2));
+    const esp_err_t e3 = nvs_erase_key(handle, "ble_addr");
+    const esp_err_t e4 = nvs_erase_key(handle, "ble_addr_cn");
+    ESP_LOGW(TAG, "Boot unpair: erase pairing_list=%s gsn=%s ble_addr=%s",
+             esp_err_to_name(e1), esp_err_to_name(e2), esp_err_to_name(e3));
+    (void)e4;
     nvs_commit(handle);
     nvs_close(handle);
 

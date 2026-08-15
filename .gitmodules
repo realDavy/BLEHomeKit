@@ -1,6 +1,3 @@
 [submodule "components/hap_wrapper/hap"]
 	path = components/hap_wrapper/hap
 	url = https://github.com/realDavy/HAP.git
-[submodule "components/yahap-pal"]
-	path = components/yahap-pal
-	url = https://github.com/rednblkx/esp32-yahap-pal.git
