@@ -48,31 +48,33 @@ static bool hap_list_means_paired(hap::platform::Storage* storage) {
 // Home's Add Accessory flow disconnects after Pair-Setup and scans again.
 // Advertising SF=0 at that moment makes iOS treat the accessory as already
 // in a Home and fail with "Discovery failed". Keep SF=1 until Pair-Verify.
+// A missing flag means "not verified yet" (Pair-Setup just wrote pairing_list).
+// Boot sanitizer writes '1' for pairings that already finished Add Accessory.
 static bool hap_should_advertise_paired(hap::platform::Storage* storage) {
     if (!hap_list_means_paired(storage)) {
         return false;
     }
     auto verified = storage->get(kPairVerifiedKey);
-    if (!verified || verified->empty()) {
-        // Pairings written before this flag existed already finished Add Accessory.
-        return true;
-    }
-    return (*verified)[0] == '1';
+    return verified && !verified->empty() && (*verified)[0] == '1';
 }
 
-static void hap_note_pair_setup_saved(hap::platform::Storage* storage, hap::platform::System* system) {
+static bool hap_note_pair_setup_saved(hap::platform::Storage* storage, hap::platform::System* system) {
     if (!hap_list_means_paired(storage)) {
-        return;
+        return false;
     }
     auto verified = storage->get(kPairVerifiedKey);
+    if (verified && !verified->empty() && (*verified)[0] == '1') {
+        return false;
+    }
     if (verified && !verified->empty() && (*verified)[0] == '0') {
-        return;
+        return true;
     }
     storage->set(kPairVerifiedKey, std::vector<uint8_t>{'0'});
     if (system) {
         system->log(hap::platform::System::LogLevel::Info,
             "[BleTransport] Pair-Setup saved controller; keep SF=1 until Pair Verify");
     }
+    return true;
 }
 
 static void hap_note_unpaired_if_empty(hap::platform::Storage* storage, hap::platform::System* system) {
@@ -1053,7 +1055,9 @@ void BleTransport::process_transaction(uint16_t connection_id, TransactionState&
              if (type == 0x4C) { // Pair Setup
                 req.path = "/pair-setup";
                 resp = config_.pairing_endpoints->handle_pair_setup(req, ctx);
-                hap_note_pair_setup_saved(config_.storage, config_.system);
+                if (hap_note_pair_setup_saved(config_.storage, config_.system)) {
+                    hap_schedule_paired_advertising(this, config_.scheduler);
+                }
              } else if (type == 0x4E) { // Pair Verify
                 req.path = "/pair-verify";
                 resp = config_.pairing_endpoints->handle_pair_verify(req, ctx);
@@ -1260,7 +1264,9 @@ void BleTransport::process_transaction(uint16_t connection_id, TransactionState&
                 if (type == 0x4C) {
                     req.path = "/pair-setup";
                     resp = config_.pairing_endpoints->handle_pair_setup(req, ctx);
-                    hap_note_pair_setup_saved(config_.storage, config_.system);
+                    if (hap_note_pair_setup_saved(config_.storage, config_.system)) {
+                        hap_schedule_paired_advertising(this, config_.scheduler);
+                    }
                 } else if (type == 0x4E) {
                     req.path = "/pair-verify";
                     resp = config_.pairing_endpoints->handle_pair_verify(req, ctx);
@@ -1575,7 +1581,9 @@ bool BleTransport::process_characteristic_write(uint16_t connection_id, uint16_t
         req.path = "/pair-setup";
         
         auto resp = config_.pairing_endpoints->handle_pair_setup(req, *session.context);
-        hap_note_pair_setup_saved(config_.storage, config_.system);
+        if (hap_note_pair_setup_saved(config_.storage, config_.system)) {
+            hap_schedule_paired_advertising(this, config_.scheduler);
+        }
         
         uint8_t status = (resp.status == Status::OK) ? 0x00 : 0x05; 
         send_response(connection_id, tid, uuid, status, resp.body);

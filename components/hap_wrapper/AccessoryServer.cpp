@@ -82,6 +82,15 @@ AccessoryServer::AccessoryServer(Config config) : config_(std::move(config)), im
         }
         
         update_mdns();
+        // Pair-Setup writes pairing_list before Pair-Verify. A missing
+        // pair_verified flag used to make this update advertise SF=0 and
+        // Home then failed Add Accessory on the post-M6 rescan.
+        if (is_add) {
+            auto verified = config_.storage->get("pair_verified");
+            if (!verified || verified->empty() || (*verified)[0] != '1') {
+                config_.storage->set("pair_verified", std::vector<uint8_t>{'0'});
+            }
+        }
         if (impl_->ble_transport) {
             impl_->ble_transport->update_advertising();
         }
