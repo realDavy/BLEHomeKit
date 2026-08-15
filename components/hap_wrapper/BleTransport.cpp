@@ -4,8 +4,10 @@
 // keep SF=1 until Pair-Verify then push SF=0 immediately (Home scans
 // for the paired accessory while still connected), do not register an
 // empty 0xFE59 GATT service, bump GSN on every disconnected knob change,
-// avoid 500 ms advertising after drop, and disconnect after Home
-// RemovePairing so advertising returns to SF=1.
+// push current On/Brightness/CT as soon as Pair-Verify and CCCDs are
+// both ready (Home often subscribes after Verify), avoid 500 ms
+// advertising after drop, and disconnect after Home RemovePairing so
+// advertising returns to SF=1.
 #include "hap/transport/BleTransport.hpp"
 #include "hap/common/TaskScheduler.hpp"
 #include "hap/transport/ConnectionContext.hpp"
@@ -132,24 +134,61 @@ static void hap_schedule_paired_advertising(hap::transport::BleTransport* transp
     transport->update_advertising();
 }
 
+static bool s_pending_state_push = false;
+static bool s_push_scheduled = false;
+static uint16_t s_held_iids[8] = {};
+static uint8_t s_held_iid_count = 0;
+static bool s_gsn_cached = false;
+static uint16_t s_cached_gsn = 1;
+
+static void hap_remember_held_iid(uint16_t iid) {
+    for (uint8_t i = 0; i < s_held_iid_count; ++i) {
+        if (s_held_iids[i] == iid) {
+            return;
+        }
+    }
+    if (s_held_iid_count < 8) {
+        s_held_iids[s_held_iid_count++] = iid;
+    }
+}
+
+static void hap_clear_held_iids() {
+    s_held_iid_count = 0;
+}
+
+static bool hap_session_encrypted(hap::transport::ble::BleSessionManager* sessions) {
+    if (!sessions) {
+        return false;
+    }
+    for (uint16_t id : sessions->get_connection_ids()) {
+        auto* session = sessions->get_session(id);
+        if (session && session->context && session->context->is_encrypted()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void hap_schedule_controller_refresh(hap::common::TaskScheduler* scheduler,
                                            std::function<void()> fn) {
     if (!fn) {
         return;
     }
     if (scheduler) {
-        // Home may still show the last cached brightness. Wait for
-        // indicate subscriptions, then push current On/Brightness/CT.
-        scheduler->schedule_once(400, std::move(fn));
+        // Run on the HAP tick task. CCCD subscribe and Pair-Verify can
+        // finish in either order; a 400 ms wait used to fire before
+        // indications were registered, so Home kept the stale cache.
+        scheduler->schedule_once(0, std::move(fn));
         return;
     }
     fn();
 }
 
-#define HAP_SCHEDULE_PUSH_CURRENT_STATE() \
-    hap_schedule_controller_refresh(config_.scheduler, [this]() { \
-        if (!session_manager_ || session_manager_->session_count() == 0) { \
-            return; \
+#define HAP_PUSH_CURRENT_STATE() \
+    do { \
+        if (!session_manager_ || !hap_session_encrypted(session_manager_.get())) { \
+            s_pending_state_push = true; \
+            break; \
         } \
         int sent = 0; \
         for (const auto& [key, uuid] : instance_map_) { \
@@ -159,12 +198,31 @@ static void hap_schedule_controller_refresh(hap::common::TaskScheduler* schedule
             send_connected_event(static_cast<uint16_t>(key.second)); \
             ++sent; \
         } \
-        if (sent > 0 && config_.system) { \
+        if (sent == 0) { \
+            s_pending_state_push = true; \
+            break; \
+        } \
+        hap_clear_held_iids(); \
+        s_pending_state_push = false; \
+        if (config_.system) { \
             config_.system->log(platform::System::LogLevel::Info, \
                 "[BleTransport] Pushed " + std::to_string(sent) + \
-                " current characteristic(s) to Home after Pair-Verify"); \
+                " current characteristic(s) to Home"); \
         } \
-    })
+    } while (0)
+
+#define HAP_SCHEDULE_PUSH_CURRENT_STATE() \
+    do { \
+        if (s_push_scheduled) { \
+            s_pending_state_push = true; \
+            break; \
+        } \
+        s_push_scheduled = true; \
+        hap_schedule_controller_refresh(config_.scheduler, [this]() { \
+            s_push_scheduled = false; \
+            HAP_PUSH_CURRENT_STATE(); \
+        }); \
+    } while (0)
 
 static std::string to_hex_string(const uint8_t* data, size_t len) {
     std::string s;
@@ -205,6 +263,8 @@ void BleTransport::start() {
             "[BleTransport] Device disconnected, connection_id=" + std::to_string(connection_id));
         
         session_manager_->remove(connection_id);
+        hap_clear_held_iids();
+        s_pending_state_push = false;
         
         config_.system->log(platform::System::LogLevel::Info, 
             "[BleTransport] Connection state cleaned up, refreshing advertising");
@@ -553,16 +613,7 @@ void BleTransport::update_advertising() {
          config_.system->log(platform::System::LogLevel::Warning, "[BleTransport] Invalid Device ID format: " + config_.accessory_id);
     }
 
-    uint16_t gsn = 1;
-    auto gsn_bytes = config_.storage->get("gsn");
-    if (gsn_bytes && gsn_bytes->size() == 2) {
-        gsn = static_cast<uint16_t>((*gsn_bytes)[0]) | (static_cast<uint16_t>((*gsn_bytes)[1]) << 8);
-        if (gsn == 0) gsn = 1;
-    } else {
-        std::vector<uint8_t> gsn_data = {0x01, 0x00};
-        config_.storage->set("gsn", gsn_data);
-        config_.system->log(platform::System::LogLevel::Info, "[BleTransport] Initialized GSN to 1");
-    }
+    uint16_t gsn = get_current_gsn();
 
     uint8_t config_number = 1;
     auto cn_bytes = config_.storage->get("config_number");
@@ -614,18 +665,18 @@ void BleTransport::notify_value_changed(uint64_t aid, uint64_t iid, const core::
 void BleTransport::increment_gsn() {
     // Per Spec 7.4.6: GSN increments on characteristic changes
     // Range: 1-65535, wraps to 1 on overflow
-    auto gsn_bytes = config_.storage->get("gsn");
-    uint16_t gsn = 1;
-    
-    if (gsn_bytes && gsn_bytes->size() == 2) {
-        gsn = static_cast<uint16_t>((*gsn_bytes)[0]) | (static_cast<uint16_t>((*gsn_bytes)[1]) << 8);
-    }
-    
+    uint16_t gsn = get_current_gsn();
     gsn++;
     if (gsn == 0) {
         gsn = 1;
     }
-    
+    s_cached_gsn = gsn;
+    s_gsn_cached = true;
+
+    // Put the new GSN on the air before the NVS commit so Home can
+    // see the disconnected event without waiting on flash.
+    update_advertising();
+
     std::vector<uint8_t> gsn_data = {
         static_cast<uint8_t>(gsn & 0xFF),
         static_cast<uint8_t>((gsn >> 8) & 0xFF)
@@ -634,8 +685,6 @@ void BleTransport::increment_gsn() {
     
     config_.system->log(platform::System::LogLevel::Debug, 
         "[BleTransport] GSN incremented to " + std::to_string(gsn));
-    
-    update_advertising();
 }
 
 void BleTransport::check_session_timeouts() {
@@ -1886,6 +1935,10 @@ void BleTransport::register_services_by_type(uint16_t filter_type) {
                 cdef.on_subscribe = [this, uuid=char_uuid](uint16_t conn_id, bool enabled) {
                      if (enabled) {
                          session_manager_->add_subscription(uuid, conn_id);
+                         // Home often writes CCCDs after Pair-Verify. Push
+                         // now so the first indication is not 400 ms late
+                         // or skipped entirely.
+                         HAP_SCHEDULE_PUSH_CURRENT_STATE();
                      } else {
                          session_manager_->remove_subscription(uuid, conn_id);
                      }
@@ -1899,11 +1952,23 @@ void BleTransport::register_services_by_type(uint16_t filter_type) {
 }
 
 uint16_t BleTransport::get_current_gsn() {
+    if (s_gsn_cached) {
+        return s_cached_gsn;
+    }
     auto gsn_bytes = config_.storage->get("gsn");
     uint16_t gsn = 1;
     if (gsn_bytes && gsn_bytes->size() == 2) {
         gsn = static_cast<uint16_t>((*gsn_bytes)[0]) | (static_cast<uint16_t>((*gsn_bytes)[1]) << 8);
+        if (gsn == 0) {
+            gsn = 1;
+        }
+    } else {
+        std::vector<uint8_t> gsn_data = {0x01, 0x00};
+        config_.storage->set("gsn", gsn_data);
+        config_.system->log(platform::System::LogLevel::Info, "[BleTransport] Initialized GSN to 1");
     }
+    s_cached_gsn = gsn;
+    s_gsn_cached = true;
     return gsn;
 }
 
@@ -1992,26 +2057,32 @@ void BleTransport::handle_characteristic_change(uint64_t aid, uint64_t iid,
     
     const uint16_t radio_links =
         config_.ble ? config_.ble->active_connections() : 0;
-    is_connected_ = session_manager_->session_count() > 0 || radio_links > 0;
+    const bool encrypted = hap_session_encrypted(session_manager_.get());
+    is_connected_ = encrypted;
     
-    if (is_connected_ && has_connected_subscribers && supports_connected) {
+    if (encrypted && has_connected_subscribers && supports_connected) {
         s_exclude_conn_id = exclude_conn_id;
         config_.system->log(platform::System::LogLevel::Info,
             "[BleTransport] Sending Connected Event for IID=" + std::to_string(iid));
         send_connected_event(static_cast<uint16_t>(iid));
         s_exclude_conn_id = UINT32_MAX;
     }
-    else if (!is_connected_ && supports_broadcast && broadcast_enabled && is_broadcast_key_valid()) {
+    else if (radio_links == 0 && supports_broadcast && broadcast_enabled && is_broadcast_key_valid()) {
         config_.system->log(platform::System::LogLevel::Info,
             "[BleTransport] Sending Broadcasted Event for IID=" + std::to_string(iid));
         send_broadcasted_event(static_cast<uint16_t>(iid), value);
     }
-    else if (!is_connected_ && supports_disconnected) {
+    else if (radio_links == 0 && supports_disconnected) {
         send_disconnected_event(static_cast<uint16_t>(iid));
     }
     else if (radio_links > 0) {
-        // BLE is up but Pair-Verify / indicate subscribe is not done.
-        // Bumping GSN here makes Home stay on 正在更新.
+        // BLE is up but Pair-Verify and/or indicate subscribe is not done.
+        // Bumping GSN here makes Home stay on 正在更新. Remember local
+        // knob changes and flush them as soon as indications are live.
+        if (exclude_conn_id == 0 || exclude_conn_id == UINT32_MAX) {
+            hap_remember_held_iid(static_cast<uint16_t>(iid));
+            s_pending_state_push = true;
+        }
         config_.system->log(platform::System::LogLevel::Info,
             "[BleTransport] Hold event IID=" + std::to_string(iid) +
             " until controller finishes Pair-Verify");

@@ -332,7 +332,7 @@ extern "C" void app_main() {
     log_heap("after ui");
 
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(20));
         server.tick();
     }
 }
