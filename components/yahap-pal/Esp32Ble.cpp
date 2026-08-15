@@ -34,6 +34,7 @@ std::vector<Esp32Ble::CharacteristicContext *> Esp32Ble::all_contexts;
 std::vector<Esp32Ble::DescriptorContext *> Esp32Ble::all_descriptor_contexts;
 static bool nimble_synced = false;
 static Esp32Ble *g_ble_instance = nullptr;
+static uint8_t g_own_addr_type = BLE_OWN_ADDR_PUBLIC;
 static std::optional<Esp32Ble::Advertisement> pending_adv;
 static std::optional<Esp32Ble::Advertisement> last_adv;
 static uint32_t pending_adv_interval = 0;
@@ -121,40 +122,19 @@ Esp32Ble::Esp32Ble(hap::platform::Storage *storage) : storage_(storage) {
     ESP_LOGI(TAG, "NimBLE Synced");
     nimble_synced = true;
 
-    uint8_t random_addr[6];
-    uint8_t stored_cn = 0;
-    uint8_t current_cn = get_current_cn();
-    bool need_new_address = true;
-
-    if (load_stored_address(random_addr, &stored_cn)) {
-      if (stored_cn == current_cn) {
-        ESP_LOGI(TAG, "Reusing stored address for CN=%d", current_cn);
-        need_new_address = false;
-      } else {
-        ESP_LOGI(TAG, "CN changed (%d -> %d), generating new address",
-                 stored_cn, current_cn);
-      }
-    } else {
-      ESP_LOGI(TAG,
-               "No stored address or regen requested, generating new address");
-    }
-
-    if (need_new_address) {
-      for (int i = 0; i < 6; ++i) {
-        random_addr[i] = (uint8_t)esp_random();
-      }
-      random_addr[5] |= 0xC0;
-      save_address(random_addr, current_cn);
-    }
-
-    int rc = ble_hs_id_set_rnd(random_addr);
+    // Use the factory public BLE MAC. A rotating random address plus a
+    // broken IRK store (status=8) lets iPhone discover HAP ads but fail
+    // to connect ("失去连接").
+    int rc = ble_hs_id_infer_auto(0, &g_own_addr_type);
     if (rc != 0) {
-      ESP_LOGE(TAG, "Failed to set random address: %d", rc);
-    } else {
-      ESP_LOGI(TAG, "Set random address: %02X:%02X:%02X:%02X:%02X:%02X",
-               random_addr[5], random_addr[4], random_addr[3], random_addr[2],
-               random_addr[1], random_addr[0]);
+      ESP_LOGW(TAG, "ble_hs_id_infer_auto rc=%d, using public", rc);
+      g_own_addr_type = BLE_OWN_ADDR_PUBLIC;
     }
+    uint8_t addr[6] = {};
+    ble_hs_id_copy_addr(g_own_addr_type, addr, nullptr);
+    ESP_LOGI(TAG, "BLE address type=%d %02X:%02X:%02X:%02X:%02X:%02X",
+             g_own_addr_type, addr[5], addr[4], addr[3], addr[2], addr[1],
+             addr[0]);
 
     if (pending_adv && g_ble_instance) {
       g_ble_instance->start_advertising(*pending_adv, pending_adv_interval);
@@ -274,7 +254,7 @@ void Esp32Ble::start_advertising(const Advertisement &data,
   adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(interval_ms);
   adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(interval_ms);
 
-  rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER, &adv_params,
+  rc = ble_gap_adv_start(g_own_addr_type, NULL, BLE_HS_FOREVER, &adv_params,
                          ble_gap_event, this);
   if (rc != 0) {
     ESP_LOGE(TAG, "error enabling advertisement; rc=%d", rc);
@@ -432,7 +412,7 @@ void Esp32Ble::start_encrypted_advertising(const EncryptedAdvertisement &data,
   adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(interval_ms);
   adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(interval_ms);
 
-  rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER, &adv_params,
+  rc = ble_gap_adv_start(g_own_addr_type, NULL, BLE_HS_FOREVER, &adv_params,
                          ble_gap_event, this);
   if (rc != 0) {
     ESP_LOGE(TAG, "Error starting encrypted advertising: rc=%d", rc);

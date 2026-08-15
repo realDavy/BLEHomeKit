@@ -65,6 +65,16 @@ void BleTransport::start() {
     setup_protocol_info_service();
     
     setup_hap_service();
+
+    // iPhone also looks for the Bluetooth SIG HAP service 0xFE59 after connect.
+    {
+        platform::Ble::ServiceDefinition fe59;
+        fe59.uuid = "FE59";
+        fe59.is_primary = true;
+        config_.ble->register_service(fe59);
+        config_.system->log(platform::System::LogLevel::Info,
+            "[BleTransport] Registered HAP service UUID 0xFE59");
+    }
     
     register_user_services();
     
