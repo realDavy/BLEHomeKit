@@ -247,7 +247,7 @@ extern "C" void app_main() {
     auto accessory = std::make_shared<hap::core::Accessory>(1);
     auto info_service = hap::service::AccessoryInformationBuilder()
         .name(HAP_DEVICE_NAME)
-        .manufacturer("Espressif")
+        .manufacturer("Aidaegis")
         .model("ESP32-C3-LCDkit")
         .serial_number(serial)
         .firmware_revision("1.0.0")

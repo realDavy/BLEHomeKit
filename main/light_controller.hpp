@@ -14,8 +14,8 @@
 class LightController {
 public:
     struct State {
-        bool on = true;
-        int brightness = 50;            // 0-100, same default as knob_panel
+        bool on = false;
+        int brightness = 0;             // off / 0% until the knob or Home turns it on
         uint32_t color_temp_mireds = 370; // warm white
     };
 
