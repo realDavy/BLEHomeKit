@@ -88,6 +88,14 @@ idf.py set-target esp32c3
 
 若已经能发现配件但配对在 Pair Setup M2 后断开：旧代码会一次 GATT Read 返回约 418 字节，超过 ATT MTU 256。新固件应打印 `Returning 253/418 bytes` 这类分片。配对码以屏幕和串口打印的 `XXX-XX-XXX` 为准。
 
+若串口是 `Advertising started` 且 `SF=0`，家庭 App **不会**把它当成新配件。这是 NVS 里残留的 `pairing_list`（哪怕只是不完整的 JSON）。新固件启动时会清掉无效配对；仍显示已配对时：
+
+- 长按旋钮 3 秒，或
+- **上电时按住旋钮约 1.5 秒**，或
+- `idf.py erase-nvs`
+
+然后先在 iPhone「家庭」里删掉旧配件，再用屏幕上的 PIN 重新添加。成功启动应看到 `HomeKit BLE unpaired (SF=1)`。
+
 USB 口打不开时，按官方下载模式：
 
 1. 按住旋钮
@@ -103,7 +111,7 @@ USB 口打不开时，按官方下载模式：
 3. 选择 **LCDkit Light**（蓝牙配件）
 4. 输入屏幕上的配对码
 
-Identify 时板载 RGB LED 会闪三次。长按旋钮 3 秒会执行 HomeKit 恢复出厂（清除配对），可重新添加。
+Identify 时板载 RGB LED 会闪三次。长按旋钮 3 秒（或上电时按住旋钮）会清除 HomeKit 配对，可重新添加。已配对时屏幕会提示 `Hold knob 3s to reset`。
 
 ## 工程结构
 

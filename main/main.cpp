@@ -1,6 +1,7 @@
 #include <esp_event.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
@@ -27,6 +28,7 @@
 
 #include "board_pins.hpp"
 #include "encoder_input.hpp"
+#include "hap_pairing.hpp"
 #include "light_controller.hpp"
 #include "light_ui.hpp"
 #include "setup_code.hpp"
@@ -80,6 +82,27 @@ static void factory_reset_hap() {
         ESP_LOGW(TAG, "Factory reset HomeKit pairing");
         s_server->factory_reset();
         light_ui_set_paired(false);
+        ESP_LOGW(TAG, "Rebooting so HomeKit advertises unpaired (SF=1)");
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
+    }
+}
+
+static void log_pairing_banner(bool paired, const std::string& setup_code) {
+    if (paired) {
+        ESP_LOGW(TAG, "================================================");
+        ESP_LOGW(TAG, "HomeKit BLE already paired (SF=0)");
+        ESP_LOGW(TAG, "iPhone will NOT show this as a new accessory.");
+        ESP_LOGW(TAG, "Hold encoder knob 3s to unpair, or hold it while");
+        ESP_LOGW(TAG, "powering on. Remove the accessory in Home first.");
+        ESP_LOGW(TAG, "================================================");
+    } else {
+        ESP_LOGI(TAG, "================================================");
+        ESP_LOGI(TAG, "HomeKit BLE unpaired (SF=1) — iPhone can add it");
+        ESP_LOGI(TAG, "Device: %s", HAP_DEVICE_NAME);
+        ESP_LOGI(TAG, "Setup code: %s", setup_code.c_str());
+        ESP_LOGI(TAG, "Home -> Add Accessory -> More Options");
+        ESP_LOGI(TAG, "================================================");
     }
 }
 
@@ -140,6 +163,16 @@ extern "C" void app_main() {
     static Esp32Storage storage_impl;
     static Esp32Crypto crypto_impl;
     static LcdkitBle ble_impl(&storage_impl);
+
+    // Leftover pairing_list (even "null" / incomplete JSON) makes HAP advertise
+    // SF=0, so Home will not show this as a new accessory. Sanitize before start.
+    if (hap_encoder_sw_held(1500)) {
+        ESP_LOGW(TAG, "Encoder held at boot: clearing HomeKit pairings");
+        hap_clear_controller_pairings(storage_impl);
+    }
+    const bool paired = hap_sanitize_pairings(storage_impl);
+    light_ui_set_paired(paired);
+    log_pairing_banner(paired, setup_code);
 
     ble_svc_gap_init();
     ble_svc_gatt_init();

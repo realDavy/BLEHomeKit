@@ -6,10 +6,27 @@
 #include "hap/core/HAPStatus.hpp"
 #include <random>
 #include <algorithm>
+#include <cctype>
 #include <cstring>
+#include <optional>
+#include <string>
 #include "hap/core/TLV8.hpp"
 #include "hap/transport/ble/BleTlvBuilder.hpp"
 #include "hap/core/CharacteristicSerializer.hpp"
+
+static bool hap_list_means_paired(const std::optional<std::vector<uint8_t>>& pairing_list) {
+    if (!pairing_list || pairing_list->empty()) {
+        return false;
+    }
+    std::string s(pairing_list->begin(), pairing_list->end());
+    auto not_space = [](unsigned char c) { return !std::isspace(c); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+    s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+    if (s.size() < 3 || s.front() != '[' || s.back() != ']') {
+        return false;
+    }
+    return s != "[]";
+}
 
 static std::string to_hex_string(const uint8_t* data, size_t len) {
     std::string s;
@@ -376,7 +393,7 @@ void BleTransport::update_advertising() {
     std::copy_n(hash_output.begin(), 4, setup_hash);
     
     auto pairing_list = config_.storage->get("pairing_list");
-    bool is_paired = (pairing_list && pairing_list->size() > 2);
+    bool is_paired = hap_list_means_paired(pairing_list);
     uint8_t status_flags = is_paired ? 0x00 : 0x01;
     
     uint8_t device_id[6] = {0};
@@ -1909,7 +1926,7 @@ void BleTransport::send_disconnected_event(uint16_t iid) {
     std::copy_n(hash_output.begin(), 4, setup_hash);
     
     auto pairing_list = config_.storage->get("pairing_list");
-    bool is_paired = (pairing_list && pairing_list->size() > 2);
+    bool is_paired = hap_list_means_paired(pairing_list);
     uint8_t status_flags = is_paired ? 0x00 : 0x01;
     
     uint8_t device_id[6] = {0};
