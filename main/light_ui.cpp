@@ -3,9 +3,18 @@
 
 #include "esp_log.h"
 #include "bsp/esp-bsp.h"
+#include "esp_lvgl_port.h"
 #include "lvgl.h"
 
 #include <cstdio>
+
+#ifndef BSP_LCD_H_RES
+#define BSP_LCD_H_RES 240
+#endif
+
+// One 20-line DMA buffer: 240 * 20 * 2 = 9.6 KB instead of the BSP default
+// ~96 KB double buffer that starves HAP/NimBLE on ESP32-C3.
+static constexpr uint32_t kDrawBufLines = 20;
 
 
 static const char* TAG = "light_ui";
@@ -51,7 +60,15 @@ static void render_state(const LightController::State& state) {
 }
 
 void light_ui_start() {
-    auto* disp = bsp_display_start();
+    bsp_display_cfg_t cfg = {};
+    lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    port_cfg.task_stack = 4096;
+    cfg.lvgl_port_cfg = port_cfg;
+    cfg.buffer_size = BSP_LCD_H_RES * kDrawBufLines;
+    cfg.double_buffer = false;
+    cfg.flags.buff_dma = 1;
+
+    auto* disp = bsp_display_start_with_config(&cfg);
     if (disp == nullptr) {
         ESP_LOGW(TAG, "Display init failed, continuing without UI");
         return;

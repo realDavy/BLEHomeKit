@@ -6,7 +6,7 @@ idf_component_register(
         "encoder_input.cpp"
         "setup_code.cpp"
     INCLUDE_DIRS "."
-    REQUIRES hap_wrapper yahap-pal esp_event nvs_flash driver esp_timer led_strip knob esp32_c3_lcdkit
+    REQUIRES hap_wrapper yahap-pal esp_event nvs_flash driver esp_timer led_strip knob esp32_c3_lcdkit bt libsodium
 )
 
 target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_20)

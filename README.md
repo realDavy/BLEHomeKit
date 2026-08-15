@@ -47,12 +47,14 @@ Home App 中的开关、亮度条、色温会驱动 LED；旋钮操作会反向�
 
 ```bash
 # 工程目前在 PR 分支上，不要只 clone 默认的 main（main 里还没有 CMakeLists.txt）
-git clone -b cursor/esp32-c3-lcdkit-hap-ble-light-b65d --recurse-submodules \
+git clone -b cursor/fix-flicker-ble-discovery-7c32 --recurse-submodules \
     https://github.com/realDavy/BLEHomeKit.git
 cd BLEHomeKit
 ls CMakeLists.txt   # 确认当前就在工程根目录
 
 . $IDF_PATH/export.sh
+# 若之前编过旧固件，必须删掉 sdkconfig，否则 BSP 双缓冲 96KB 的默认值会留下来
+rm -f sdkconfig
 idf.py set-target esp32c3
 idf.py build
 idf.py -p /dev/ttyACM0 flash monitor
@@ -63,13 +65,26 @@ idf.py -p /dev/ttyACM0 flash monitor
 ```bash
 cd BLEHomeKit
 git fetch origin
-git checkout cursor/esp32-c3-lcdkit-hap-ble-light-b65d
+git checkout cursor/fix-flicker-ble-discovery-7c32
 git submodule update --init --recursive
+rm -f sdkconfig
 ls CMakeLists.txt
 idf.py set-target esp32c3
 ```
 
 若出现 `CMakeLists.txt not found in project directory .../examples`，说明还在上级目录，执行 `cd BLEHomeKit` 后再跑 `idf.py`。
+
+### 屏闪 / 家庭 App 搜不到蓝牙配件
+
+旧固件在 `[BleTransport] Starting...` 之后会 `abort()` 并重启。原因是 ESP32-C3-LCDkit BSP 默认给 LVGL 分配 **双缓冲 240×100（约 96 KB）**，剩下的堆不够 HAP 注册 GATT，`new` 失败即 `abort()`。屏幕跟着重启循环闪，广播也起不来。
+
+本分支改为：
+
+- 单缓冲 20 行（约 9.6 KB）
+- 先启动 HAP-BLE，再启动 LVGL
+- 补上 NimBLE GAP/GATT 服务和 `sodium_init`
+
+重新编译前请删除工程目录里的 `sdkconfig`（见上方命令），否则旧的缓冲配置会继续生效。启动成功时应能看到 `NimBLE Synced`、`Advertising started`，以及 `heap after hap start` 仍有空闲内存。配对码以屏幕和串口打印的 `XXX-XX-XXX` 为准。
 
 USB 口打不开时，按官方下载模式：
 

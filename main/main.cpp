@@ -1,8 +1,13 @@
 #include <esp_event.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
+#include <nvs_flash.h>
+#include <services/gap/ble_svc_gap.h>
+#include <services/gatt/ble_svc_gatt.h>
+#include <sodium.h>
 
 #include "Esp32Ble.hpp"
 #include "Esp32Crypto.hpp"
@@ -67,6 +72,13 @@ static void factory_reset_hap() {
     }
 }
 
+static void log_heap(const char* where) {
+    ESP_LOGI(TAG, "heap %s: free=%u largest=%u",
+             where,
+             static_cast<unsigned>(esp_get_free_heap_size()),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+}
+
 static void hap_work_task(void* arg) {
     auto* queue = static_cast<QueueHandle_t>(arg);
     while (true) {
@@ -80,6 +92,19 @@ static void hap_work_task(void* arg) {
 
 extern "C" void app_main() {
     ESP_LOGI(TAG, "ESP32-C3-LCDkit HAP-BLE light starting");
+    log_heap("boot");
+
+    // NVS before anything that may persist pairing / BLE address.
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_ret);
+
+    if (sodium_init() < 0) {
+        ESP_LOGE(TAG, "sodium_init failed");
+    }
 
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
@@ -96,13 +121,19 @@ extern "C" void app_main() {
     const std::string setup_code = hap_setup_code_from_mac();
     const std::string serial = hap_serial_from_mac();
     light_ui_set_setup_code(setup_code.c_str());
-    light_ui_start();
-    encoder_input_start_with_reset(factory_reset_hap);
 
+    // Bring up HAP-BLE before LVGL. The BSP default display buffers used ~96 KB
+    // and left too little heap for GATT registration, which abort()ed and
+    // rebooted (screen flicker + iPhone cannot discover the accessory).
     static Esp32System system_impl;
     static Esp32Storage storage_impl;
     static Esp32Crypto crypto_impl;
     static Esp32Ble ble_impl(&storage_impl);
+
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    ble_svc_gap_set_name(HAP_DEVICE_NAME);
+    log_heap("after nimble_port_init");
 
     hap::AccessoryServer::Config config;
     config.system = &system_impl;
@@ -199,7 +230,13 @@ extern "C" void app_main() {
     });
 
     ESP_LOGI(TAG, "HAP-BLE advertising as '%s', setup code %s", HAP_DEVICE_NAME, setup_code.c_str());
+    log_heap("before hap start");
     server.start();
+    log_heap("after hap start");
+
+    light_ui_start();
+    encoder_input_start_with_reset(factory_reset_hap);
+    log_heap("after ui");
 
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(100));
