@@ -3,7 +3,7 @@
 // procedure timeout while waiting for the next pair-setup write,
 // keep SF=1 until Pair-Verify then push SF=0 immediately (Home scans
 // for the paired accessory while still connected), do not register an
-// empty 0xFE59 GATT service, coalesce disconnected-event GSN bumps,
+// empty 0xFE59 GATT service, bump GSN on every disconnected knob change,
 // avoid 500 ms advertising after drop, and disconnect after Home
 // RemovePairing so advertising returns to SF=1.
 #include "hap/transport/BleTransport.hpp"
@@ -21,11 +21,11 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <functional>
 #include "hap/core/TLV8.hpp"
 #include "hap/transport/ble/BleTlvBuilder.hpp"
 #include "hap/core/CharacteristicSerializer.hpp"
 
-static bool s_gsn_bumped_while_disconnected = false;
 static uint32_t s_exclude_conn_id = UINT32_MAX;
 static uint16_t s_disconnect_after_read = 0;
 static constexpr const char* kPairVerifiedKey = "pair_verified";
@@ -132,6 +132,40 @@ static void hap_schedule_paired_advertising(hap::transport::BleTransport* transp
     transport->update_advertising();
 }
 
+static void hap_schedule_controller_refresh(hap::common::TaskScheduler* scheduler,
+                                           std::function<void()> fn) {
+    if (!fn) {
+        return;
+    }
+    if (scheduler) {
+        // Home may still show the last cached brightness. Wait for
+        // indicate subscriptions, then push current On/Brightness/CT.
+        scheduler->schedule_once(400, std::move(fn));
+        return;
+    }
+    fn();
+}
+
+#define HAP_SCHEDULE_PUSH_CURRENT_STATE() \
+    hap_schedule_controller_refresh(config_.scheduler, [this]() { \
+        if (!session_manager_ || session_manager_->session_count() == 0) { \
+            return; \
+        } \
+        int sent = 0; \
+        for (const auto& [key, uuid] : instance_map_) { \
+            if (!session_manager_->has_subscribers(uuid)) { \
+                continue; \
+            } \
+            send_connected_event(static_cast<uint16_t>(key.second)); \
+            ++sent; \
+        } \
+        if (sent > 0 && config_.system) { \
+            config_.system->log(platform::System::LogLevel::Info, \
+                "[BleTransport] Pushed " + std::to_string(sent) + \
+                " current characteristic(s) to Home after Pair-Verify"); \
+        } \
+    })
+
 static std::string to_hex_string(const uint8_t* data, size_t len) {
     std::string s;
     char buf[3];
@@ -174,7 +208,6 @@ void BleTransport::start() {
         
         config_.system->log(platform::System::LogLevel::Info, 
             "[BleTransport] Connection state cleaned up, refreshing advertising");
-        s_gsn_bumped_while_disconnected = false;
         if (s_disconnect_after_read == connection_id) {
             s_disconnect_after_read = 0;
         }
@@ -1064,6 +1097,9 @@ void BleTransport::process_transaction(uint16_t connection_id, TransactionState&
                 if (hap_note_pair_verify_done(config_.storage, config_.system, ctx.is_encrypted())) {
                     hap_schedule_paired_advertising(this, config_.scheduler);
                 }
+                if (ctx.is_encrypted()) {
+                    HAP_SCHEDULE_PUSH_CURRENT_STATE();
+                }
              } else if (type == 0x50) { // Pairings
                 req.path = "/pairings";
                 resp = config_.pairing_endpoints->handle_pairings(req, ctx);
@@ -1272,6 +1308,9 @@ void BleTransport::process_transaction(uint16_t connection_id, TransactionState&
                     resp = config_.pairing_endpoints->handle_pair_verify(req, ctx);
                     if (hap_note_pair_verify_done(config_.storage, config_.system, ctx.is_encrypted())) {
                         hap_schedule_paired_advertising(this, config_.scheduler);
+                    }
+                    if (ctx.is_encrypted()) {
+                        HAP_SCHEDULE_PUSH_CURRENT_STATE();
                     }
                 } else if (type == 0x50) {
                     req.path = "/pairings";
@@ -1598,6 +1637,9 @@ bool BleTransport::process_characteristic_write(uint16_t connection_id, uint16_t
         auto resp = config_.pairing_endpoints->handle_pair_verify(req, *session.context);
         if (hap_note_pair_verify_done(config_.storage, config_.system, session.context->is_encrypted())) {
             hap_schedule_paired_advertising(this, config_.scheduler);
+        }
+        if (session.context->is_encrypted()) {
+            HAP_SCHEDULE_PUSH_CURRENT_STATE();
         }
         uint8_t status = (resp.status == Status::OK) ? 0x00 : 0x05;
         send_response(connection_id, tid, uuid, status, resp.body);
@@ -2062,68 +2104,12 @@ void BleTransport::send_broadcasted_event(uint16_t iid, const core::Value& value
 }
 
 void BleTransport::send_disconnected_event(uint16_t iid) {
-    // Per HAP Spec 7.4.6.3 Disconnected Events:
-    // Increment GSN once per disconnected period, then fast-advertise.
-    // Extra characteristic changes must not stop/start advertising again
-    // or iPhone cannot reconnect (Home shows 未响应).
-    if (s_gsn_bumped_while_disconnected) {
-        config_.system->log(platform::System::LogLevel::Debug,
-            "[BleTransport] Disconnected Event IID=" + std::to_string(iid) +
-            " skipped (GSN already incremented this disconnect period)");
-        return;
-    }
-    s_gsn_bumped_while_disconnected = true;
-
+    // Per HAP Spec 7.4.6.3: increment GSN on each disconnected change so
+    // Home reconnects and reads the latest brightness. increment_gsn()
+    // updates advertising in place at 20 ms.
     config_.system->log(platform::System::LogLevel::Info,
         "[BleTransport] Disconnected Event for IID=" + std::to_string(iid));
-    
     increment_gsn();
-    
-    std::string setup_id;
-    auto setup_id_bytes = config_.storage->get("setup_id");
-    if (setup_id_bytes && setup_id_bytes->size() == 4) {
-        setup_id = std::string(setup_id_bytes->begin(), setup_id_bytes->end());
-    } else {
-        setup_id = "X-HZ";
-    }
-    
-    std::string input = setup_id + config_.accessory_id;
-    std::array<uint8_t, 64> hash_output = {};
-    config_.crypto->sha512(
-        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(input.data()), input.size()),
-        std::span<uint8_t, 64>(hash_output.data(), 64)
-    );
-    uint8_t setup_hash[4];
-    std::copy_n(hash_output.begin(), 4, setup_hash);
-    
-    uint8_t status_flags = hap_should_advertise_paired(config_.storage) ? 0x00 : 0x01;
-    
-    uint8_t device_id[6] = {0};
-    sscanf(config_.accessory_id.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-        &device_id[0], &device_id[1], &device_id[2],
-        &device_id[3], &device_id[4], &device_id[5]);
-    
-    uint16_t gsn = get_current_gsn();
-    
-    uint8_t config_number = 1;
-    auto cn_bytes = config_.storage->get("config_number");
-    if (cn_bytes && !cn_bytes->empty()) {
-        std::string cn_str(cn_bytes->begin(), cn_bytes->end());
-        config_number = static_cast<uint8_t>(std::stoi(cn_str));
-    }
-    
-    auto adv = platform::Ble::Advertisement::create_hap(
-        status_flags, device_id, config_.category_id, gsn, config_number, setup_hash);
-    adv.local_name = config_.device_name;
-    
-    // Keep 20 ms advertising after a GSN bump. Switching to 500 ms after 3 s
-    // made iPhone miss the accessory (Home 未响应) while the knob was still
-    // being turned.
-    config_.system->log(platform::System::LogLevel::Info,
-        "[BleTransport] Disconnected Event advertising at 20ms (GSN updated)");
-    config_.ble->start_advertising(adv, 20);
-    
-    (void)iid;
 }
 
 std::vector<uint8_t> BleTransport::build_encrypted_advertisement_payload(uint16_t iid, const core::Value& value) {
