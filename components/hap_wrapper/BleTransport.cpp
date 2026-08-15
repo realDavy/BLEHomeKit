@@ -275,18 +275,20 @@ void BleTransport::start() {
             s_disconnect_after_read = 0;
         }
         // After Add Accessory the iPhone hangs up. Bump GSN once so Home
-        // treats this as a disconnected event and reconnects instead of
-        // staying on 未响应 with GSN=1. Run on the HAP tick task — this
-        // callback is NimBLE host and must not do SHA-512 / gap restart.
+        // treats this as a disconnected event and reconnects. Wait until
+        // Esp32Ble has restarted advertising (100 ms) so this does not
+        // fight NimBLE connection teardown.
         if (s_gsn_on_first_verify_drop) {
             s_gsn_on_first_verify_drop = false;
             if (config_.scheduler) {
-                config_.scheduler->schedule_once(0, [this]() { increment_gsn(); });
+                config_.scheduler->schedule_once(150, [this]() { increment_gsn(); });
             } else {
                 increment_gsn();
             }
+        } else if (config_.scheduler) {
+            config_.scheduler->schedule_once(150, [this]() { update_advertising(); });
         } else {
-            hap_schedule_paired_advertising(this, config_.scheduler);
+            update_advertising();
         }
     });
 

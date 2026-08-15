@@ -43,6 +43,7 @@ static uint32_t last_adv_interval = 20;
 static uint16_t s_ble_conns = 0;
 static bool s_force_adv_restart = false;
 static esp_timer_handle_t s_adv_ensure_timer = nullptr;
+static int s_adv_ensure_pass = 0;
 
 struct QueuedIndicate {
   uint16_t conn_id = 0;
@@ -133,11 +134,19 @@ static void adv_ensure_timer_cb(void *arg) {
     return;
   }
   if (ble_gap_adv_active()) {
-    ESP_LOGI(TAG, "Advertising still active after disconnect");
-    return;
+    ESP_LOGI(TAG, "Advertising confirmed after disconnect (pass %d)",
+             s_adv_ensure_pass);
+  } else {
+    ESP_LOGW(TAG, "Advertising not active after disconnect; starting (pass %d)",
+             s_adv_ensure_pass);
+    force_start_last_adv("ensure-timer");
   }
-  ESP_LOGW(TAG, "Advertising stopped after disconnect; restarting");
-  force_start_last_adv("ensure-timer");
+  if (s_adv_ensure_pass < 1) {
+    ++s_adv_ensure_pass;
+    if (s_adv_ensure_timer != nullptr) {
+      esp_timer_start_once(s_adv_ensure_timer, 200000);
+    }
+  }
 }
 
 static void schedule_adv_ensure() {
@@ -154,8 +163,11 @@ static void schedule_adv_ensure() {
       return;
     }
   }
+  s_adv_ensure_pass = 0;
   esp_timer_stop(s_adv_ensure_timer);
-  esp_timer_start_once(s_adv_ensure_timer, 80000);
+  // Start after NimBLE finishes tearing down the connection. Starting
+  // from the disconnect callback itself is often undone by the stack.
+  esp_timer_start_once(s_adv_ensure_timer, 100000);
 }
 
 static void force_start_last_adv(const char *why) {
@@ -365,8 +377,10 @@ void Esp32Ble::start_advertising(const Advertisement &data,
   }
 
   // Flip SF / GSN without stopping. iPhone scans for SF=0 while still
-  // connected at the end of Add Accessory.
-  if (ble_gap_adv_active() && last_adv_interval == interval_ms) {
+  // connected at the end of Add Accessory. After disconnect, force a
+  // real stop/start — in-place updates keep the while-connected instance
+  // that NimBLE then tears down (Home stays 未响应).
+  if (!force && ble_gap_adv_active() && last_adv_interval == interval_ms) {
     const int rc = apply_advertising_fields(data);
     if (rc == 0) {
       last_adv = data;
@@ -866,9 +880,11 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
     {
       clear_indicate_queue();
       auto self = static_cast<Esp32Ble *>(arg);
-      // NimBLE often reports advertising still active here, then tears it
-      // down after this callback. Skipping the restart leaves Home at 未响应.
-      force_start_last_adv("disconnect");
+      // Do not start advertising here. NimBLE is still cleaning up the
+      // link and will drop a start issued from this callback. Stop now
+      // and start again from the 100 ms timer.
+      ble_gap_adv_stop();
+      ESP_LOGI(TAG, "Advertising stopped on disconnect; will restart shortly");
       schedule_adv_ensure();
       if (self && self->disconnect_callback_) {
         self->disconnect_callback_(event->disconnect.conn.conn_handle);
