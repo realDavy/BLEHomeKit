@@ -111,6 +111,17 @@ void hap_clear_controller_pairings(hap::platform::Storage& storage) {
 }
 
 bool hap_sanitize_pairings(hap::platform::Storage& storage) {
+    // One-time: leftover debug pairings advertise SF=0 and Home will not
+    // show this as a new accessory. Later pairings are kept (marker set).
+    if (!storage.has("clr_pair_v1")) {
+        if (storage.has("pairing_list")) {
+            ESP_LOGW(TAG, "One-time clear of leftover HomeKit pairings (SF=1)");
+            hap_clear_controller_pairings(storage);
+        }
+        const uint8_t mark[] = {1};
+        storage.set("clr_pair_v1", mark);
+    }
+
     auto list = storage.get("pairing_list");
     if (!list || list->empty()) {
         ESP_LOGI(TAG, "HAP pairings: none (SF=1)");

@@ -7,60 +7,39 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "iot_knob.h"
 
 static const char* TAG = "encoder";
 
-static constexpr int kPollMs = 2;
+static constexpr int kPollMs = 10;
 static constexpr int kDebounceMs = 30;
 static constexpr int kClickMaxMs = 800;
 static constexpr int kLongPressMs = 3000;
 
-// One mechanical detent is typically four quadrature steps.
-static constexpr int kStepsPerDetent = 4;
-
 static void (*s_factory_reset)() = nullptr;
 
-// Standard 2-bit gray-code quadrature table.
-static const int8_t kQuadTable[16] = {
-    0, -1,  1,  0,
-    1,  0,  0, -1,
-   -1,  0,  0,  1,
-    0,  1, -1,  0
-};
+static void knob_left_cb(void* /*arg*/, void* /*data*/) {
+    LightController::instance().encoder_dimmer();
+}
 
-static void encoder_task(void* /*arg*/) {
+static void knob_right_cb(void* /*arg*/, void* /*data*/) {
+    LightController::instance().encoder_brighter();
+}
+
+static void button_task(void* /*arg*/) {
+    int64_t press_start_ms = 0;
+    bool pressed = false;
+    bool long_fired = false;
+
     gpio_config_t io = {};
-    io.pin_bit_mask = (1ULL << BOARD_ENCODER_A) |
-                      (1ULL << BOARD_ENCODER_B) |
-                      (1ULL << BOARD_ENCODER_SW);
+    io.pin_bit_mask = 1ULL << BOARD_ENCODER_SW;
     io.mode = GPIO_MODE_INPUT;
     io.pull_up_en = GPIO_PULLUP_ENABLE;
     io.pull_down_en = GPIO_PULLDOWN_DISABLE;
     io.intr_type = GPIO_INTR_DISABLE;
     gpio_config(&io);
 
-    uint8_t enc_prev = static_cast<uint8_t>(
-        (gpio_get_level(BOARD_ENCODER_A) << 1) | gpio_get_level(BOARD_ENCODER_B));
-    int enc_accum = 0;
-
-    int64_t press_start_ms = 0;
-    bool pressed = false;
-    bool long_fired = false;
-
     while (true) {
-        const uint8_t a = static_cast<uint8_t>(gpio_get_level(BOARD_ENCODER_A));
-        const uint8_t b = static_cast<uint8_t>(gpio_get_level(BOARD_ENCODER_B));
-        const uint8_t curr = static_cast<uint8_t>((a << 1) | b);
-        enc_accum += kQuadTable[(enc_prev << 2) | curr];
-        enc_prev = curr;
-        if (enc_accum >= kStepsPerDetent) {
-            enc_accum = 0;
-            LightController::instance().encoder_brighter();
-        } else if (enc_accum <= -kStepsPerDetent) {
-            enc_accum = 0;
-            LightController::instance().encoder_dimmer();
-        }
-
         const bool level_pressed = gpio_get_level(BOARD_ENCODER_SW) == 0;
         const int64_t now = esp_timer_get_time() / 1000;
 
@@ -87,17 +66,30 @@ static void encoder_task(void* /*arg*/) {
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(kPollMs));
+        // pdMS_TO_TICKS(2) is 0 at the default 100 Hz tick and busy-loops
+        // the IDLE task (TWDT). Always block at least one tick.
+        vTaskDelay(pdMS_TO_TICKS(kPollMs) < 1 ? 1 : pdMS_TO_TICKS(kPollMs));
     }
 }
 
 void encoder_input_start_with_reset(void (*factory_reset)()) {
     s_factory_reset = factory_reset;
-    // Do not create a second iot_knob: bsp_display_start_with_config already
-    // attaches one to the same A/B GPIOs. Poll the pins instead.
-    xTaskCreate(encoder_task, "enc_in", 3072, nullptr, 5, nullptr);
-    ESP_LOGI(TAG, "Encoder A=%d B=%d SW=%d (GPIO poll, no second knob)",
-             BOARD_ENCODER_A, BOARD_ENCODER_B, BOARD_ENCODER_SW);
+
+    knob_config_t cfg = {};
+    cfg.default_direction = 0;
+    cfg.gpio_encoder_a = BOARD_ENCODER_A;
+    cfg.gpio_encoder_b = BOARD_ENCODER_B;
+
+    knob_handle_t knob = iot_knob_create(&cfg);
+    if (knob == nullptr) {
+        ESP_LOGW(TAG, "iot_knob_create failed (BSP may already own A/B); brightness via HomeKit still works");
+    } else {
+        iot_knob_register_cb(knob, KNOB_LEFT, knob_left_cb, nullptr);
+        iot_knob_register_cb(knob, KNOB_RIGHT, knob_right_cb, nullptr);
+    }
+
+    xTaskCreate(button_task, "enc_btn", 3072, nullptr, 5, nullptr);
+    ESP_LOGI(TAG, "Encoder A=%d B=%d SW=%d", BOARD_ENCODER_A, BOARD_ENCODER_B, BOARD_ENCODER_SW);
 }
 
 void encoder_input_start() {
