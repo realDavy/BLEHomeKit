@@ -96,7 +96,7 @@ static void factory_reset_hap() {
         ESP_LOGW(TAG, "Factory reset HomeKit pairing");
         s_server->factory_reset();
         light_ui_set_paired(false);
-        ESP_LOGW(TAG, "Rebooting so HomeKit advertises unpaired (SF=1)");
+        ESP_LOGW(TAG, "Rebooting so HomeKit advertises unpaired (SF=1), same Device ID");
         vTaskDelay(pdMS_TO_TICKS(200));
         esp_restart();
     }
@@ -212,11 +212,25 @@ extern "C" void app_main() {
     config.on_identify = []() {
         LightController::instance().identify();
     };
-    config.on_pairings_changed = [work_queue](const hap::PairingEvent& event) {
-        auto* job = new std::function<void()>([event]() {
-            ESP_LOGI(TAG, "Pairing event %d id=%s",
-                     static_cast<int>(event.type), event.pairing_id.c_str());
-            light_ui_set_paired(event.type == hap::PairingEventType::Added);
+    config.on_pairings_changed = [work_queue, &storage_impl](const hap::PairingEvent& event) {
+        auto* job = new std::function<void()>([event, &storage_impl]() {
+            bool paired = event.type == hap::PairingEventType::Added;
+            if (event.type == hap::PairingEventType::Removed) {
+                auto list = storage_impl.get("pairing_list");
+                if (list && list->size() > 2) {
+                    const std::string raw(list->begin(), list->end());
+                    paired = raw != "[]";
+                } else {
+                    paired = false;
+                }
+            }
+            ESP_LOGI(TAG, "Pairing event %d id=%s paired=%d",
+                     static_cast<int>(event.type), event.pairing_id.c_str(), paired ? 1 : 0);
+            light_ui_set_paired(paired);
+            if (!paired) {
+                ESP_LOGW(TAG, "HomeKit unpaired — iPhone can add this accessory again");
+                log_pairing_banner(false, hap_setup_code_from_mac());
+            }
         });
         if (xQueueSend(work_queue, &job, 0) != pdTRUE) {
             delete job;

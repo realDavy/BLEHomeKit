@@ -2,8 +2,10 @@
 // fragment HAP-BLE GATT reads to ATT MTU, do not apply the 10s
 // procedure timeout while waiting for the next pair-setup write,
 // keep SF=1 until Pair-Verify, do not register an empty 0xFE59 GATT service,
-// coalesce disconnected-event GSN bumps, and avoid 500 ms advertising after drop.
+// coalesce disconnected-event GSN bumps, avoid 500 ms advertising after drop,
+// and disconnect after Home RemovePairing so advertising returns to SF=1.
 #include "hap/transport/BleTransport.hpp"
+#include "hap/transport/ConnectionContext.hpp"
 #include "hap/core/CharacteristicFinder.hpp"
 #include "hap/core/HAPStatus.hpp"
 #include "hap/platform/Storage.hpp"
@@ -23,6 +25,7 @@
 static bool s_adv_dirty = false;
 static bool s_gsn_bumped_while_disconnected = false;
 static uint32_t s_exclude_conn_id = UINT32_MAX;
+static uint16_t s_disconnect_after_read = 0;
 static constexpr const char* kPairVerifiedKey = "pair_verified";
 
 static bool hap_list_means_paired(hap::platform::Storage* storage) {
@@ -64,6 +67,30 @@ static void hap_note_pair_setup_saved(hap::platform::Storage* storage, hap::plat
     if (system) {
         system->log(hap::platform::System::LogLevel::Info,
             "[BleTransport] Pair-Setup saved controller; keep SF=1 until Pair Verify");
+    }
+}
+
+static void hap_note_unpaired_if_empty(hap::platform::Storage* storage, hap::platform::System* system) {
+    if (!storage || hap_list_means_paired(storage)) {
+        return;
+    }
+    storage->remove(kPairVerifiedKey);
+    if (system) {
+        system->log(hap::platform::System::LogLevel::Info,
+            "[BleTransport] No controllers left; next advertisement uses SF=1");
+    }
+}
+
+static void hap_after_pairings(hap::platform::Storage* storage, hap::platform::System* system,
+                              hap::transport::ConnectionContext& ctx, uint16_t connection_id) {
+    hap_note_unpaired_if_empty(storage, system);
+    if (!ctx.should_close()) {
+        return;
+    }
+    s_disconnect_after_read = connection_id;
+    if (system) {
+        system->log(hap::platform::System::LogLevel::Info,
+            "[BleTransport] RemovePairing: will disconnect after response");
     }
 }
 
@@ -127,6 +154,9 @@ void BleTransport::start() {
             "[BleTransport] Connection state cleaned up, refreshing advertising");
         s_adv_dirty = false;
         s_gsn_bumped_while_disconnected = false;
+        if (s_disconnect_after_read == connection_id) {
+            s_disconnect_after_read = 0;
+        }
         update_advertising();
     });
 
@@ -730,6 +760,22 @@ std::vector<uint8_t> BleTransport::handle_hap_read(uint16_t connection_id) {
         std::to_string(fragment.size()) + "/" + std::to_string(buf.size()) +
         " bytes (offset=" + std::to_string(state.response_read_offset) +
         " mtu=" + std::to_string(mtu) + ")");
+
+    if (state.response_read_offset >= buf.size() &&
+        s_disconnect_after_read == connection_id && config_.ble) {
+        s_disconnect_after_read = 0;
+        const uint16_t conn = connection_id;
+        auto disconnect = [this, conn]() {
+            config_.system->log(platform::System::LogLevel::Info,
+                "[BleTransport] Disconnecting after RemovePairing");
+            config_.ble->disconnect(conn);
+        };
+        if (config_.scheduler) {
+            config_.scheduler->schedule_once(200, std::move(disconnect));
+        } else {
+            disconnect();
+        }
+    }
     return fragment;
 }
 
@@ -993,6 +1039,7 @@ void BleTransport::process_transaction(uint16_t connection_id, TransactionState&
              } else if (type == 0x50) { // Pairings
                 req.path = "/pairings";
                 resp = config_.pairing_endpoints->handle_pairings(req, ctx);
+                hap_after_pairings(config_.storage, config_.system, ctx, connection_id);
              } else if (type == 0xA5) { // Service Signature
                 config_.system->log(platform::System::LogLevel::Info, "[BleTransport] Software Auth Write - Skipping (Success)");
                 resp = Response{Status::OK}; 
@@ -1197,6 +1244,7 @@ void BleTransport::process_transaction(uint16_t connection_id, TransactionState&
                 } else if (type == 0x50) {
                     req.path = "/pairings";
                     resp = config_.pairing_endpoints->handle_pairings(req, ctx);
+                    hap_after_pairings(config_.storage, config_.system, ctx, connection_id);
                 }
                 
                 status = (resp.status == Status::OK) ? 0x00 : 0x02;
@@ -1528,6 +1576,7 @@ bool BleTransport::process_characteristic_write(uint16_t connection_id, uint16_t
         req.path = "/pairings";
         
         auto resp = config_.pairing_endpoints->handle_pairings(req, *session.context);
+        hap_after_pairings(config_.storage, config_.system, *session.context, connection_id);
         uint8_t status = (resp.status == Status::OK) ? 0x00 : 0x05;
         send_response(connection_id, tid, uuid, status, resp.body);
         return true;

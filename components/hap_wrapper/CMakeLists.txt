@@ -5,7 +5,7 @@
 
 idf_component_register(
     SRCS
-        "hap/src/AccessoryServer.cpp"
+        "AccessoryServer.cpp"  # overlay: unpair keeps Device ID / BLE address
         "hap/src/common/TaskScheduler.cpp"
         "hap/src/core/TLV8.cpp"
         "hap/src/core/AttributeDatabaseJSON.cpp"
