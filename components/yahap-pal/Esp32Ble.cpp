@@ -16,6 +16,7 @@
 #endif
 #include <cstdlib>
 #include <cstring>
+#include <host/ble_gap.h>
 #include <nimble/nimble_port.h>
 #include <nimble/nimble_port_freertos.h>
 #include <optional>
@@ -196,6 +197,14 @@ void Esp32Ble::start_advertising(const Advertisement &data,
 
   if (interval_ms > 20) {
     interval_ms = 20;
+  }
+
+  if (last_adv.has_value() && last_adv_interval == interval_ms &&
+      last_adv->manufacturer_data == data.manufacturer_data &&
+      last_adv->local_name == data.local_name && last_adv->flags == data.flags &&
+      last_adv->company_id == data.company_id && ble_gap_adv_active()) {
+    ESP_LOGD(TAG, "Advertising already current, skip restart");
+    return;
   }
 
   memset(&adv_params, 0, sizeof adv_params);
@@ -598,6 +607,15 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
         break;
       }
       ESP_LOGI(TAG, "Connected handle=%d", event->connect.conn_handle);
+      struct ble_gap_conn_desc desc;
+      if (ble_gap_conn_find(event->connect.conn_handle, &desc) == 0) {
+        ESP_LOGI(TAG,
+                 "Peer %02X:%02X:%02X:%02X:%02X:%02X type=%d",
+                 desc.peer_ota_addr.val[5], desc.peer_ota_addr.val[4],
+                 desc.peer_ota_addr.val[3], desc.peer_ota_addr.val[2],
+                 desc.peer_ota_addr.val[1], desc.peer_ota_addr.val[0],
+                 desc.peer_ota_addr.type);
+      }
       struct ble_gap_upd_params params = {};
       params.itvl_min = 16;
       params.itvl_max = 48;

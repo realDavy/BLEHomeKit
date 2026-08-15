@@ -3,6 +3,7 @@
 
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
@@ -10,6 +11,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -174,4 +177,69 @@ bool hap_sanitize_pairings(hap::platform::Storage& storage) {
              static_cast<unsigned>(ids.size()),
              advertise_paired ? "SF=0 after Pair Verify" : "SF=1 until Pair Verify");
     return advertise_paired;
+}
+
+static bool parse_device_id(const std::string& id, uint8_t out[6]) {
+    unsigned b[6] = {};
+    if (std::sscanf(id.c_str(), "%02X:%02X:%02X:%02X:%02X:%02X",
+                    &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
+        return false;
+    }
+    for (int i = 0; i < 6; ++i) {
+        out[i] = static_cast<uint8_t>(b[i]);
+    }
+    return true;
+}
+
+static void store_device_id(hap::platform::Storage& storage, const uint8_t mac[6]) {
+    char buf[18];
+    std::snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    const std::string id(buf);
+    storage.set("accessory_id", std::vector<uint8_t>(id.begin(), id.end()));
+    ESP_LOGI(TAG, "HAP Device ID set to BT MAC %s", buf);
+}
+
+bool hap_align_ble_identity(hap::platform::Storage& storage) {
+    uint8_t factory_bt[6] = {};
+    if (esp_read_mac(factory_bt, ESP_MAC_BT) != ESP_OK) {
+        ESP_LOGW(TAG, "Factory BT MAC unavailable");
+        return true;
+    }
+
+    uint8_t device_id[6] = {};
+    bool have_stored = false;
+    auto stored = storage.get("accessory_id");
+    if (stored && !stored->empty()) {
+        const std::string id(stored->begin(), stored->end());
+        have_stored = parse_device_id(id, device_id);
+        if (!have_stored) {
+            ESP_LOGW(TAG, "Ignoring invalid accessory_id '%s'", id.c_str());
+        }
+    }
+
+    if (have_stored && std::memcmp(device_id, factory_bt, 6) == 0) {
+        ESP_LOGI(TAG, "HAP Device ID already matches BT MAC");
+        return true;
+    }
+
+    if (have_stored) {
+        const esp_err_t err = esp_iface_mac_addr_set(device_id, ESP_MAC_BT);
+        if (err == ESP_OK) {
+            ESP_LOGW(TAG,
+                     "BT MAC set to HAP Device ID %02X:%02X:%02X:%02X:%02X:%02X "
+                     "(iPhone reconnects to this address)",
+                     device_id[0], device_id[1], device_id[2],
+                     device_id[3], device_id[4], device_id[5]);
+            return true;
+        }
+        ESP_LOGW(TAG, "esp_iface_mac_addr_set failed (%s); using factory BT MAC as Device ID",
+                 esp_err_to_name(err));
+        hap_clear_controller_pairings(storage);
+        store_device_id(storage, factory_bt);
+        return false;
+    }
+
+    store_device_id(storage, factory_bt);
+    return true;
 }

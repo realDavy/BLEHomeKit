@@ -163,7 +163,6 @@ extern "C" void app_main() {
     static Esp32System system_impl;
     static Esp32Storage storage_impl;
     static Esp32Crypto crypto_impl;
-    static LcdkitBle ble_impl(&storage_impl);
 
     // Leftover or incomplete pairing_list makes HAP advertise SF=0, so Home
     // will not show this as a new accessory. Sanitize before start. Pair-Setup
@@ -172,7 +171,13 @@ extern "C" void app_main() {
         ESP_LOGW(TAG, "Encoder held at boot: clearing HomeKit pairings");
         hap_clear_controller_pairings(storage_impl);
     }
-    const bool paired = hap_sanitize_pairings(storage_impl);
+    bool paired = hap_sanitize_pairings(storage_impl);
+    // NimBLE reads the public address at init. Align Device ID and BT MAC first
+    // so iPhone can reconnect after Pair-Setup (otherwise Home shows 未响应).
+    if (!hap_align_ble_identity(storage_impl)) {
+        paired = false;
+    }
+    static LcdkitBle ble_impl(&storage_impl);
     light_ui_set_paired(paired);
     log_pairing_banner(paired, setup_code);
 

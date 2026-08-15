@@ -20,6 +20,7 @@
 #include "hap/core/CharacteristicSerializer.hpp"
 
 static bool s_adv_dirty = false;
+static bool s_gsn_bumped_while_disconnected = false;
 static constexpr const char* kPairVerifiedKey = "pair_verified";
 
 static bool hap_list_means_paired(hap::platform::Storage* storage) {
@@ -123,6 +124,7 @@ void BleTransport::start() {
         config_.system->log(platform::System::LogLevel::Info, 
             "[BleTransport] Connection state cleaned up, refreshing advertising");
         s_adv_dirty = false;
+        s_gsn_bumped_while_disconnected = false;
         update_advertising();
     });
 
@@ -924,6 +926,10 @@ void BleTransport::process_transaction(uint16_t connection_id, TransactionState&
             }
         }
         
+        config_.system->log(platform::System::LogLevel::Info,
+            "[BleTransport] Characteristic Read IID=" + std::to_string(iid) +
+            " status=" + std::to_string(status) +
+            " len=" + std::to_string(value_bytes.size()));
         send_response(connection_id, state.transaction_id, state.target_uuid, status, value_bytes);
     }
     else if (opcode == PDUOpcode::CharacteristicWrite) {
@@ -1967,10 +1973,18 @@ void BleTransport::send_broadcasted_event(uint16_t iid, const core::Value& value
 
 void BleTransport::send_disconnected_event(uint16_t iid) {
     // Per HAP Spec 7.4.6.3 Disconnected Events:
-    // Increment GSN (once per disconnected period until connected) and
-    // use 20ms advertising for at least 3 seconds, then revert to normal.
-    
-    config_.system->log(platform::System::LogLevel::Debug,
+    // Increment GSN once per disconnected period, then fast-advertise.
+    // Extra characteristic changes must not stop/start advertising again
+    // or iPhone cannot reconnect (Home shows 未响应).
+    if (s_gsn_bumped_while_disconnected) {
+        config_.system->log(platform::System::LogLevel::Debug,
+            "[BleTransport] Disconnected Event IID=" + std::to_string(iid) +
+            " skipped (GSN already incremented this disconnect period)");
+        return;
+    }
+    s_gsn_bumped_while_disconnected = true;
+
+    config_.system->log(platform::System::LogLevel::Info,
         "[BleTransport] Disconnected Event for IID=" + std::to_string(iid));
     
     increment_gsn();
