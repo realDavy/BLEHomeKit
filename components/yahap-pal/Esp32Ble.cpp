@@ -1,5 +1,6 @@
 #include <sdkconfig.h>
 #if CONFIG_BT_NIMBLE_ENABLED
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <esp_err.h>
@@ -38,6 +39,41 @@ static std::optional<Esp32Ble::Advertisement> last_adv;
 static uint32_t pending_adv_interval = 0;
 static uint32_t last_adv_interval = 20;
 
+// HAP Spec 7.1: accessories use a static random address. The 48-bit
+// address must match the HAP Device ID so iPhone can reconnect after
+// Pair-Setup (public + random-rotating both show up as 未响应).
+static void use_hap_static_random_addr() {
+  uint8_t rnd[6] = {};
+  bool have_id = false;
+  if (g_storage) {
+    auto stored = g_storage->get("accessory_id");
+    if (stored && !stored->empty()) {
+      const std::string id(stored->begin(), stored->end());
+      unsigned b[6] = {};
+      if (std::sscanf(id.c_str(), "%02X:%02X:%02X:%02X:%02X:%02X", &b[0], &b[1],
+                      &b[2], &b[3], &b[4], &b[5]) == 6) {
+        for (int i = 0; i < 6; ++i) {
+          rnd[i] = static_cast<uint8_t>(b[5 - i]);
+        }
+        have_id = true;
+      }
+    }
+  }
+  if (!have_id) {
+    ble_hs_id_copy_addr(BLE_ADDR_PUBLIC, rnd, nullptr);
+  }
+  if ((rnd[5] & 0xc0) != 0xc0) {
+    rnd[5] |= 0xc0;
+  }
+  const int rc = ble_hs_id_set_rnd(rnd);
+  if (rc != 0) {
+    ESP_LOGW(TAG, "ble_hs_id_set_rnd rc=%d, using public address", rc);
+    g_own_addr_type = BLE_OWN_ADDR_PUBLIC;
+    return;
+  }
+  g_own_addr_type = BLE_OWN_ADDR_RANDOM;
+}
+
 static void parse_uuid(const std::string &uuid_str, ble_uuid_any_t *uuid) {
   ESP_LOGD(TAG, "Parsing UUID: %s", uuid_str.c_str());
 
@@ -74,14 +110,7 @@ Esp32Ble::Esp32Ble(hap::platform::Storage *storage) : storage_(storage) {
     ESP_LOGI(TAG, "NimBLE Synced");
     nimble_synced = true;
 
-    // Use the factory public BLE MAC. A rotating random address plus a
-    // broken IRK store (status=8) lets iPhone discover HAP ads but fail
-    // to connect ("失去连接").
-    int rc = ble_hs_id_infer_auto(0, &g_own_addr_type);
-    if (rc != 0) {
-      ESP_LOGW(TAG, "ble_hs_id_infer_auto rc=%d, using public", rc);
-      g_own_addr_type = BLE_OWN_ADDR_PUBLIC;
-    }
+    use_hap_static_random_addr();
     uint8_t addr[6] = {};
     ble_hs_id_copy_addr(g_own_addr_type, addr, nullptr);
     ESP_LOGI(TAG, "BLE address type=%d %02X:%02X:%02X:%02X:%02X:%02X",
@@ -141,6 +170,18 @@ void Esp32Ble::start_advertising(const Advertisement &data,
     return;
   }
 
+  if (interval_ms > 20) {
+    interval_ms = 20;
+  }
+
+  if (last_adv.has_value() && last_adv_interval == interval_ms &&
+      last_adv->manufacturer_data == data.manufacturer_data &&
+      last_adv->local_name == data.local_name && last_adv->flags == data.flags &&
+      last_adv->company_id == data.company_id && ble_gap_adv_active()) {
+    ESP_LOGD(TAG, "Advertising already current, skip restart");
+    return;
+  }
+
   ble_gap_adv_stop();
 
   struct ble_gap_adv_params adv_params;
@@ -176,6 +217,9 @@ void Esp32Ble::start_advertising(const Advertisement &data,
   adv_fields.uuids16 = &hap_uuid;
   adv_fields.num_uuids16 = 1;
   adv_fields.uuids16_is_complete = 1;
+  rsp_fields.uuids16 = &hap_uuid;
+  rsp_fields.num_uuids16 = 1;
+  rsp_fields.uuids16_is_complete = 1;
 
   rc = ble_gap_adv_set_fields(&adv_fields);
   if (rc != 0) {
@@ -183,6 +227,8 @@ void Esp32Ble::start_advertising(const Advertisement &data,
     adv_fields.uuids16 = nullptr;
     adv_fields.num_uuids16 = 0;
     rc = ble_gap_adv_set_fields(&adv_fields);
+  } else {
+    ESP_LOGI(TAG, "Advertisement includes 0xFE59");
   }
   if (rc != 0) {
     ESP_LOGE(TAG, "error setting adv fields; rc=%d", rc);
@@ -191,19 +237,13 @@ void Esp32Ble::start_advertising(const Advertisement &data,
 
   rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
   if (rc != 0) {
+    ESP_LOGW(TAG, "scan rsp with FE59 failed rc=%d, retry name only", rc);
+    rsp_fields.uuids16 = nullptr;
+    rsp_fields.num_uuids16 = 0;
+    rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
+  }
+  if (rc != 0) {
     ESP_LOGE(TAG, "error setting rsp fields; rc=%d", rc);
-    return;
-  }
-
-  if (interval_ms > 20) {
-    interval_ms = 20;
-  }
-
-  if (last_adv.has_value() && last_adv_interval == interval_ms &&
-      last_adv->manufacturer_data == data.manufacturer_data &&
-      last_adv->local_name == data.local_name && last_adv->flags == data.flags &&
-      last_adv->company_id == data.company_id && ble_gap_adv_active()) {
-    ESP_LOGD(TAG, "Advertising already current, skip restart");
     return;
   }
 
@@ -641,12 +681,20 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
           self->enc_adv_timer_ = nullptr;
         }
       }
+      // Keep advertising while connected so iPhone can come back immediately
+      // after this link drops (Home otherwise stays 未响应).
+      if (self && last_adv.has_value()) {
+        self->start_advertising(*last_adv, 20);
+      }
     }
     break;
   case BLE_GAP_EVENT_DISCONNECT:
     ESP_LOGI(TAG, "Disconnected, reason=0x%x", event->disconnect.reason);
     {
       auto self = static_cast<Esp32Ble *>(arg);
+      if (self && last_adv.has_value()) {
+        self->start_advertising(*last_adv, 20);
+      }
       if (self && self->disconnect_callback_) {
         self->disconnect_callback_(event->disconnect.conn.conn_handle);
       }
