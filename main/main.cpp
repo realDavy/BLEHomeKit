@@ -132,7 +132,7 @@ extern "C" void app_main() {
 
     ble_svc_gap_init();
     ble_svc_gatt_init();
-    ble_svc_gap_set_name(HAP_DEVICE_NAME);
+    ble_svc_gap_device_name_set(HAP_DEVICE_NAME);
     log_heap("after nimble_port_init");
 
     hap::AccessoryServer::Config config;
