@@ -228,9 +228,9 @@ extern "C" void app_main() {
                      static_cast<int>(event.type), event.pairing_id.c_str(), paired ? 1 : 0);
             light_ui_set_paired(paired);
             if (paired) {
-                ESP_LOGW(TAG, "Paired. If Home shows 未响应, keep this iPhone next");
-                ESP_LOGW(TAG, "to the board with Bluetooth on. A distant HomePod");
-                ESP_LOGW(TAG, "or Apple TV cannot reach a BLE-only accessory.");
+                ESP_LOGW(TAG, "Paired. Leave the accessory settings page,");
+                ESP_LOGW(TAG, "turn OFF iPhone Wi-Fi, then tap the light tile.");
+                ESP_LOGW(TAG, "A distant HomePod/Apple TV makes Home show 未响应.");
             } else {
                 ESP_LOGW(TAG, "HomeKit unpaired — iPhone can add this accessory again");
                 log_pairing_banner(false, hap_setup_code_from_mac());

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <esp_err.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <optional>
 #include <span>
 #include <string>
@@ -40,6 +41,8 @@ static std::optional<Esp32Ble::Advertisement> last_adv;
 static uint32_t pending_adv_interval = 0;
 static uint32_t last_adv_interval = 20;
 static uint16_t s_ble_conns = 0;
+static bool s_force_adv_restart = false;
+static esp_timer_handle_t s_adv_ensure_timer = nullptr;
 
 struct QueuedIndicate {
   uint16_t conn_id = 0;
@@ -120,6 +123,50 @@ static void use_hap_static_random_addr() {
     return;
   }
   g_own_addr_type = BLE_OWN_ADDR_RANDOM;
+}
+
+static void force_start_last_adv(const char *why);
+
+static void adv_ensure_timer_cb(void *arg) {
+  (void)arg;
+  if (!last_adv.has_value() || g_ble_instance == nullptr) {
+    return;
+  }
+  if (ble_gap_adv_active()) {
+    ESP_LOGI(TAG, "Advertising still active after disconnect");
+    return;
+  }
+  ESP_LOGW(TAG, "Advertising stopped after disconnect; restarting");
+  force_start_last_adv("ensure-timer");
+}
+
+static void schedule_adv_ensure() {
+  if (s_adv_ensure_timer == nullptr) {
+    esp_timer_create_args_t args = {
+        .callback = adv_ensure_timer_cb,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "adv_ensure",
+        .skip_unhandled_events = true,
+    };
+    if (esp_timer_create(&args, &s_adv_ensure_timer) != ESP_OK) {
+      ESP_LOGW(TAG, "Failed to create advertising ensure timer");
+      return;
+    }
+  }
+  esp_timer_stop(s_adv_ensure_timer);
+  esp_timer_start_once(s_adv_ensure_timer, 80000);
+}
+
+static void force_start_last_adv(const char *why) {
+  if (g_ble_instance == nullptr || !last_adv.has_value()) {
+    ESP_LOGW(TAG, "Cannot restart advertising (%s): no last payload", why);
+    return;
+  }
+  ESP_LOGI(TAG, "Force advertising restart (%s)", why);
+  s_force_adv_restart = true;
+  const uint32_t interval = last_adv_interval != 0 ? last_adv_interval : 20;
+  g_ble_instance->start_advertising(*last_adv, interval);
 }
 
 static void log_adv_identity(const hap::platform::Ble::Advertisement &data) {
@@ -309,8 +356,11 @@ void Esp32Ble::start_advertising(const Advertisement &data,
       last_adv->local_name == data.local_name && last_adv->flags == data.flags &&
       last_adv->company_id == data.company_id;
 
-  if (same_payload && ble_gap_adv_active()) {
-    ESP_LOGD(TAG, "Advertising already current, skip restart");
+  const bool force = s_force_adv_restart;
+  s_force_adv_restart = false;
+
+  if (!force && same_payload && ble_gap_adv_active()) {
+    ESP_LOGI(TAG, "Advertising already current, skip restart");
     return;
   }
 
@@ -802,6 +852,11 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
              event->notify_tx.conn_handle, event->notify_tx.status);
     flush_indicate_queue();
     break;
+  case BLE_GAP_EVENT_ADV_COMPLETE:
+    ESP_LOGW(TAG, "Advertising complete reason=%d; restarting",
+             event->adv_complete.reason);
+    force_start_last_adv("adv-complete");
+    break;
   case BLE_GAP_EVENT_DISCONNECT:
     if (s_ble_conns > 0) {
       --s_ble_conns;
@@ -811,9 +866,10 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
     {
       clear_indicate_queue();
       auto self = static_cast<Esp32Ble *>(arg);
-      if (self && last_adv.has_value()) {
-        self->start_advertising(*last_adv, 20);
-      }
+      // NimBLE often reports advertising still active here, then tears it
+      // down after this callback. Skipping the restart leaves Home at 未响应.
+      force_start_last_adv("disconnect");
+      schedule_adv_ensure();
       if (self && self->disconnect_callback_) {
         self->disconnect_callback_(event->disconnect.conn.conn_handle);
       }

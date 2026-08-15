@@ -52,7 +52,7 @@ static void render_state(const LightController::State& state) {
     if (s_paired) {
         lv_label_set_text(s_status, "HomeKit paired");
         lv_obj_clear_flag(s_setup, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(s_setup, "Hold knob 3s to reset");
+        lv_label_set_text(s_setup, "Off phone Wi-Fi to control");
     } else {
         lv_label_set_text(s_status, "HomeKit BLE");
         lv_obj_clear_flag(s_setup, LV_OBJ_FLAG_HIDDEN);

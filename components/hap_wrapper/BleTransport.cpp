@@ -103,6 +103,8 @@ static void hap_after_pairings(hap::platform::Storage* storage, hap::platform::S
     }
 }
 
+static bool s_gsn_on_first_verify_drop = false;
+
 static bool hap_note_pair_verify_done(hap::platform::Storage* storage, hap::platform::System* system,
                                      bool encrypted) {
     if (!encrypted || !storage) {
@@ -113,6 +115,7 @@ static bool hap_note_pair_verify_done(hap::platform::Storage* storage, hap::plat
         return false;
     }
     storage->set(kPairVerifiedKey, std::vector<uint8_t>{'1'});
+    s_gsn_on_first_verify_drop = true;
     if (system) {
         system->log(hap::platform::System::LogLevel::Info,
             "[BleTransport] Pair-Verify succeeded; advertise SF=0 while still connected");
@@ -271,7 +274,20 @@ void BleTransport::start() {
         if (s_disconnect_after_read == connection_id) {
             s_disconnect_after_read = 0;
         }
-        update_advertising();
+        // After Add Accessory the iPhone hangs up. Bump GSN once so Home
+        // treats this as a disconnected event and reconnects instead of
+        // staying on 未响应 with GSN=1. Run on the HAP tick task — this
+        // callback is NimBLE host and must not do SHA-512 / gap restart.
+        if (s_gsn_on_first_verify_drop) {
+            s_gsn_on_first_verify_drop = false;
+            if (config_.scheduler) {
+                config_.scheduler->schedule_once(0, [this]() { increment_gsn(); });
+            } else {
+                increment_gsn();
+            }
+        } else {
+            hap_schedule_paired_advertising(this, config_.scheduler);
+        }
     });
 
     register_accessory_info_service();
