@@ -186,8 +186,8 @@ extern "C" void app_main() {
         hap_clear_controller_pairings(storage_impl);
     }
     bool paired = hap_sanitize_pairings(storage_impl);
-    // NimBLE reads the public address at init. Align Device ID and BT MAC first
-    // so iPhone can reconnect after Pair-Setup (otherwise Home shows 未响应).
+    // HAP-BLE Device ID must be a static random address, equal to AdvA.
+    // Using the factory public MAC here makes Home show 未响应 after pairing.
     if (!hap_align_ble_identity(storage_impl)) {
         paired = false;
     }

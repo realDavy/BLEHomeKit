@@ -19,7 +19,9 @@ void hap_clear_controller_pairings(hap::platform::Storage& storage);
 // Pair-Setup without Pair-Verify still returns false so Home can rediscover.
 bool hap_sanitize_pairings(hap::platform::Storage& storage);
 
-// Make the public BLE MAC match the HAP Device ID (or write the factory
-// BT MAC as Device ID). Must run before NimBLE init. Returns false if
-// pairings were cleared because the identity had to change.
+// Ensure accessory_id is a HAP static-random Device ID (top two bits of
+// the first octet are 11) and is not the factory public MAC. The BLE
+// radio address must be this same 48-bit value or iPhone cannot reconnect
+// after Add Accessory (Home 未响应). Returns false if pairings were
+// cleared because the identity had to change.
 bool hap_align_ble_identity(hap::platform::Storage& storage);

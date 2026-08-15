@@ -97,6 +97,9 @@ static void use_hap_static_random_addr() {
       unsigned b[6] = {};
       if (std::sscanf(id.c_str(), "%02X:%02X:%02X:%02X:%02X:%02X", &b[0], &b[1],
                       &b[2], &b[3], &b[4], &b[5]) == 6) {
+        // NimBLE stores addresses LSB-first. Do not OR 0xC0 here: the
+        // stored Device ID is already a static random address, and
+        // changing bits would make AdvA != HAP Device ID (未响应).
         for (int i = 0; i < 6; ++i) {
           rnd[i] = static_cast<uint8_t>(b[5 - i]);
         }
@@ -105,10 +108,9 @@ static void use_hap_static_random_addr() {
     }
   }
   if (!have_id) {
-    ble_hs_id_copy_addr(BLE_ADDR_PUBLIC, rnd, nullptr);
-  }
-  if ((rnd[5] & 0xc0) != 0xc0) {
-    rnd[5] |= 0xc0;
+    ESP_LOGW(TAG, "No HAP Device ID; generating a static random address");
+    esp_fill_random(rnd, sizeof(rnd));
+    rnd[5] = static_cast<uint8_t>((rnd[5] & 0x3f) | 0xc0);
   }
   const int rc = ble_hs_id_set_rnd(rnd);
   if (rc != 0) {

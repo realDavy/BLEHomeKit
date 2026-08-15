@@ -5,6 +5,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
@@ -198,15 +199,33 @@ static void store_device_id(hap::platform::Storage& storage, const uint8_t mac[6
                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     const std::string id(buf);
     storage.set("accessory_id", std::vector<uint8_t>(id.begin(), id.end()));
-    ESP_LOGI(TAG, "HAP Device ID set to BT MAC %s", buf);
+    ESP_LOGI(TAG, "HAP Device ID %s (static random, matches BLE address)", buf);
+}
+
+static bool is_static_random_addr(const uint8_t id[6]) {
+    // BLE static random: bits 47 and 46 of the 48-bit address are 1.
+    // Those bits live in the most-significant (first displayed) octet.
+    return (id[0] & 0xC0) == 0xC0;
+}
+
+static bool mac_equals(const uint8_t a[6], const uint8_t b[6]) {
+    return std::memcmp(a, b, 6) == 0;
+}
+
+static void generate_static_random_id(uint8_t out[6]) {
+    esp_fill_random(out, 6);
+    out[0] = static_cast<uint8_t>((out[0] & 0x3F) | 0xC0);
+}
+
+static bool read_factory_mac(esp_mac_type_t type, uint8_t out[6]) {
+    return esp_read_mac(out, type) == ESP_OK;
 }
 
 bool hap_align_ble_identity(hap::platform::Storage& storage) {
     uint8_t factory_bt[6] = {};
-    if (esp_read_mac(factory_bt, ESP_MAC_BT) != ESP_OK) {
-        ESP_LOGW(TAG, "Factory BT MAC unavailable");
-        return true;
-    }
+    uint8_t factory_wifi[6] = {};
+    const bool have_bt = read_factory_mac(ESP_MAC_BT, factory_bt);
+    const bool have_wifi = read_factory_mac(ESP_MAC_WIFI_STA, factory_wifi);
 
     uint8_t device_id[6] = {};
     bool have_stored = false;
@@ -219,28 +238,27 @@ bool hap_align_ble_identity(hap::platform::Storage& storage) {
         }
     }
 
-    if (have_stored && std::memcmp(device_id, factory_bt, 6) == 0) {
-        ESP_LOGI(TAG, "HAP Device ID already matches BT MAC");
+    const bool usable = have_stored && is_static_random_addr(device_id) &&
+                        !(have_bt && mac_equals(device_id, factory_bt)) &&
+                        !(have_wifi && mac_equals(device_id, factory_wifi));
+    if (usable) {
+        ESP_LOGI(TAG,
+                 "HAP Device ID %02X:%02X:%02X:%02X:%02X:%02X (static random)",
+                 device_id[0], device_id[1], device_id[2],
+                 device_id[3], device_id[4], device_id[5]);
         return true;
     }
 
     if (have_stored) {
-        const esp_err_t err = esp_iface_mac_addr_set(device_id, ESP_MAC_BT);
-        if (err == ESP_OK) {
-            ESP_LOGW(TAG,
-                     "BT MAC set to HAP Device ID %02X:%02X:%02X:%02X:%02X:%02X "
-                     "(iPhone reconnects to this address)",
-                     device_id[0], device_id[1], device_id[2],
-                     device_id[3], device_id[4], device_id[5]);
-            return true;
-        }
-        ESP_LOGW(TAG, "esp_iface_mac_addr_set failed (%s); using factory BT MAC as Device ID",
-                 esp_err_to_name(err));
+        ESP_LOGW(TAG,
+                 "Device ID %02X:%02X:%02X:%02X:%02X:%02X is a public MAC or "
+                 "not static-random; iPhone cannot reconnect after pairing",
+                 device_id[0], device_id[1], device_id[2],
+                 device_id[3], device_id[4], device_id[5]);
         hap_clear_controller_pairings(storage);
-        store_device_id(storage, factory_bt);
-        return false;
     }
 
-    store_device_id(storage, factory_bt);
-    return true;
+    generate_static_random_id(device_id);
+    store_device_id(storage, device_id);
+    return false;
 }
