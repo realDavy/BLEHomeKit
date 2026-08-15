@@ -18,8 +18,8 @@ config PAL_BLE_ENABLED
 
 config PAL_NETWORK_ENABLED
     bool "Enable IP support (WiFi)"
-    default y
-    depends on LWIP_ENABLE && LWIP_IPV4 && ESP_NETIF_TCPIP_LWIP
+    default n
+    depends on ESP_WIFI_ENABLED && LWIP_ENABLE && LWIP_IPV4 && ESP_NETIF_TCPIP_LWIP
 
 
   menu "iTWT Configuration"
