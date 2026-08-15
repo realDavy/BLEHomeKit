@@ -1,7 +1,8 @@
 // Local overlay of hap/src/transport/BleTransport.cpp:
 // fragment HAP-BLE GATT reads to ATT MTU, do not apply the 10s
 // procedure timeout while waiting for the next pair-setup write,
-// keep SF=1 until Pair-Verify, and do not register an empty 0xFE59 GATT service.
+// keep SF=1 until Pair-Verify, do not register an empty 0xFE59 GATT service,
+// coalesce disconnected-event GSN bumps, and avoid 500 ms advertising after drop.
 #include "hap/transport/BleTransport.hpp"
 #include "hap/core/CharacteristicFinder.hpp"
 #include "hap/core/HAPStatus.hpp"
@@ -21,6 +22,7 @@
 
 static bool s_adv_dirty = false;
 static bool s_gsn_bumped_while_disconnected = false;
+static uint32_t s_exclude_conn_id = UINT32_MAX;
 static constexpr const char* kPairVerifiedKey = "pair_verified";
 
 static bool hap_list_means_paired(hap::platform::Storage* storage) {
@@ -1864,9 +1866,11 @@ void BleTransport::handle_characteristic_change(uint64_t aid, uint64_t iid,
     is_connected_ = session_manager_->session_count() > 0;
     
     if (is_connected_ && has_connected_subscribers && supports_connected) {
+        s_exclude_conn_id = exclude_conn_id;
         config_.system->log(platform::System::LogLevel::Info,
             "[BleTransport] Sending Connected Event for IID=" + std::to_string(iid));
         send_connected_event(static_cast<uint16_t>(iid));
+        s_exclude_conn_id = UINT32_MAX;
     }
     else if (!is_connected_ && supports_broadcast && broadcast_enabled && is_broadcast_key_valid()) {
         config_.system->log(platform::System::LogLevel::Info,
@@ -1874,8 +1878,6 @@ void BleTransport::handle_characteristic_change(uint64_t aid, uint64_t iid,
         send_broadcasted_event(static_cast<uint16_t>(iid), value);
     }
     else if (!is_connected_ && supports_disconnected) {
-        config_.system->log(platform::System::LogLevel::Info,
-            "[BleTransport] Sending Disconnected Event for IID=" + std::to_string(iid));
         send_disconnected_event(static_cast<uint16_t>(iid));
     }
     else {
@@ -1914,6 +1916,9 @@ void BleTransport::send_connected_event(uint16_t iid) {
     std::vector<uint8_t> empty_indication;
     
     for (uint16_t conn_id : session_manager_->get_subscribers(uuid)) {
+        if (conn_id == s_exclude_conn_id) {
+            continue;
+        }
         config_.system->log(platform::System::LogLevel::Debug,
             "[BleTransport] Sending zero-length indication to conn=" + std::to_string(conn_id) + 
             " for IID=" + std::to_string(iid));
@@ -2026,17 +2031,12 @@ void BleTransport::send_disconnected_event(uint16_t iid) {
         status_flags, device_id, config_.category_id, gsn, config_number, setup_hash);
     adv.local_name = config_.device_name;
     
-    // Per HAP Spec 7.4.6.3: Use fast interval (20 ms) for 3 seconds, then normal interval
+    // Keep 20 ms advertising after a GSN bump. Switching to 500 ms after 3 s
+    // made iPhone miss the accessory (Home 未响应) while the knob was still
+    // being turned.
     config_.system->log(platform::System::LogLevel::Info,
-        "[BleTransport] Starting timed advertising for Disconnected Event (" + 
-        std::to_string(config_.ble->interval_config.fast_interval_ms) + "ms for " +
-        std::to_string(config_.ble->interval_config.fast_duration_ms) + "ms)");
-    config_.ble->start_timed_advertising(
-        adv, 
-        config_.ble->interval_config.fast_interval_ms,
-        config_.ble->interval_config.fast_duration_ms,
-        config_.ble->interval_config.normal_interval_ms
-    );
+        "[BleTransport] Disconnected Event advertising at 20ms (GSN updated)");
+    config_.ble->start_advertising(adv, 20);
     
     (void)iid;
 }

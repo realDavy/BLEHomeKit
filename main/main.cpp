@@ -50,6 +50,8 @@ static std::shared_ptr<hap::core::Characteristic> s_on_char;
 static std::shared_ptr<hap::core::Characteristic> s_brightness_char;
 static std::shared_ptr<hap::core::Characteristic> s_color_temp_char;
 static bool s_updating_from_hap = false;
+static LightController::State s_last_hap_state{};
+static bool s_have_last_hap_state = false;
 
 static std::shared_ptr<hap::core::Characteristic> find_characteristic(
     const std::shared_ptr<hap::core::Service>& service, uint64_t type) {
@@ -61,19 +63,31 @@ static std::shared_ptr<hap::core::Characteristic> find_characteristic(
     return nullptr;
 }
 
+static void remember_hap_state(const LightController::State& state) {
+    s_last_hap_state = state;
+    s_have_last_hap_state = true;
+}
+
 static void hap_sync_from_light(const LightController::State& state) {
     if (s_updating_from_hap) {
+        remember_hap_state(state);
         return;
     }
-    if (s_on_char) {
+    const bool sync_on = !s_have_last_hap_state || s_last_hap_state.on != state.on;
+    const bool sync_bri =
+        !s_have_last_hap_state || s_last_hap_state.brightness != state.brightness;
+    const bool sync_ct = !s_have_last_hap_state ||
+                         s_last_hap_state.color_temp_mireds != state.color_temp_mireds;
+    if (s_on_char && sync_on) {
         s_on_char->set_value(state.on);
     }
-    if (s_brightness_char) {
+    if (s_brightness_char && sync_bri) {
         s_brightness_char->set_value(static_cast<int32_t>(state.brightness));
     }
-    if (s_color_temp_char) {
+    if (s_color_temp_char && sync_ct) {
         s_color_temp_char->set_value(state.color_temp_mireds);
     }
+    remember_hap_state(state);
     light_ui_refresh();
 }
 
@@ -234,6 +248,7 @@ extern "C" void app_main() {
             ESP_LOGI(TAG, "HomeKit On=%d", on);
             s_updating_from_hap = true;
             LightController::instance().set_on(on);
+            remember_hap_state(LightController::instance().state());
             s_updating_from_hap = false;
             light_ui_refresh();
         })
@@ -241,6 +256,7 @@ extern "C" void app_main() {
             ESP_LOGI(TAG, "HomeKit Brightness=%d", brightness);
             s_updating_from_hap = true;
             LightController::instance().set_brightness(brightness);
+            remember_hap_state(LightController::instance().state());
             s_updating_from_hap = false;
             light_ui_refresh();
         });
@@ -262,6 +278,7 @@ extern "C" void app_main() {
             ESP_LOGI(TAG, "HomeKit ColorTemperature=%lu", static_cast<unsigned long>(mireds));
             s_updating_from_hap = true;
             LightController::instance().set_color_temp(mireds);
+            remember_hap_state(LightController::instance().state());
             s_updating_from_hap = false;
             light_ui_refresh();
             return std::nullopt;
@@ -269,6 +286,7 @@ extern "C" void app_main() {
     }
 
     const auto initial = LightController::instance().state();
+    remember_hap_state(initial);
     if (s_on_char) {
         s_on_char->set_value(initial.on);
     }

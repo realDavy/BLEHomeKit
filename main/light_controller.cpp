@@ -138,8 +138,13 @@ void LightController::encoder_brighter() {
     State snapshot;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        state_.brightness = snap_up(state_.brightness);
-        state_.on = state_.brightness > 0;
+        const int next = snap_up(state_.brightness);
+        const bool next_on = next > 0;
+        if (state_.brightness == next && state_.on == next_on) {
+            return;
+        }
+        state_.brightness = next;
+        state_.on = next_on;
         apply_locked();
         cb = listener_;
         snapshot = state_;
@@ -154,8 +159,13 @@ void LightController::encoder_dimmer() {
     State snapshot;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        state_.brightness = snap_down(state_.brightness);
-        state_.on = state_.brightness > 0;
+        const int next = snap_down(state_.brightness);
+        const bool next_on = next > 0;
+        if (state_.brightness == next && state_.on == next_on) {
+            return;
+        }
+        state_.brightness = next;
+        state_.on = next_on;
         apply_locked();
         cb = listener_;
         snapshot = state_;

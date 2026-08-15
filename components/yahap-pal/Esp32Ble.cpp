@@ -6,6 +6,7 @@
 #include <esp_err.h>
 #include <esp_log.h>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,50 @@ static std::optional<Esp32Ble::Advertisement> pending_adv;
 static std::optional<Esp32Ble::Advertisement> last_adv;
 static uint32_t pending_adv_interval = 0;
 static uint32_t last_adv_interval = 20;
+
+struct QueuedIndicate {
+  uint16_t conn_id = 0;
+  uint16_t attr_handle = 0;
+  std::vector<uint8_t> data;
+};
+
+static bool s_indicate_busy = false;
+static std::vector<QueuedIndicate> s_indicate_q;
+
+static void clear_indicate_queue() {
+  s_indicate_busy = false;
+  s_indicate_q.clear();
+}
+
+static bool start_indicate(uint16_t conn_id, uint16_t attr_handle,
+                           std::span<const uint8_t> data) {
+  static const uint8_t kEmpty = 0;
+  const uint8_t *ptr = data.empty() ? &kEmpty : data.data();
+  struct os_mbuf *om = ble_hs_mbuf_from_flat(ptr, data.size());
+  if (om == nullptr) {
+    ESP_LOGW(TAG, "indicate mbuf alloc failed attr=%u", attr_handle);
+    return false;
+  }
+  const int rc = ble_gatts_indicate_custom(conn_id, attr_handle, om);
+  if (rc != 0) {
+    ESP_LOGW(TAG, "indicate failed conn=%u attr=%u rc=%d", conn_id, attr_handle,
+             rc);
+    return false;
+  }
+  s_indicate_busy = true;
+  return true;
+}
+
+static void flush_indicate_queue() {
+  s_indicate_busy = false;
+  while (!s_indicate_q.empty()) {
+    QueuedIndicate next = std::move(s_indicate_q.front());
+    s_indicate_q.erase(s_indicate_q.begin());
+    if (start_indicate(next.conn_id, next.attr_handle, next.data)) {
+      return;
+    }
+  }
+}
 
 // HAP Spec 7.1: accessories use a static random address. The 48-bit
 // address must match the HAP Device ID so iPhone can reconnect after
@@ -458,14 +503,28 @@ bool Esp32Ble::send_indication(uint16_t connection_id,
     }
   }
 
-  if (attr_handle != 0) {
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(data.data(), data.size());
-    return !ble_gatts_indicate_custom(connection_id, attr_handle, om);
-  } else {
+  if (attr_handle == 0) {
     ESP_LOGW(TAG, "Characteristic %s not found for indication",
              characteristic_uuid.c_str());
     return false;
   }
+
+  // NimBLE allows one GATT procedure at a time. Rapid encoder / Home writes
+  // used to start overlapping indicates and iPhone dropped the link (0x213).
+  if (s_indicate_busy) {
+    for (auto &queued : s_indicate_q) {
+      if (queued.attr_handle == attr_handle) {
+        queued.conn_id = connection_id;
+        queued.data.assign(data.begin(), data.end());
+        return true;
+      }
+    }
+    s_indicate_q.push_back(
+        QueuedIndicate{connection_id, attr_handle,
+                       std::vector<uint8_t>(data.begin(), data.end())});
+    return true;
+  }
+  return start_indicate(connection_id, attr_handle, data);
 }
 
 int Esp32Ble::gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
@@ -688,9 +747,15 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
       }
     }
     break;
+  case BLE_GAP_EVENT_NOTIFY_TX:
+    ESP_LOGD(TAG, "Indicate complete conn=%d status=%d",
+             event->notify_tx.conn_handle, event->notify_tx.status);
+    flush_indicate_queue();
+    break;
   case BLE_GAP_EVENT_DISCONNECT:
     ESP_LOGI(TAG, "Disconnected, reason=0x%x", event->disconnect.reason);
     {
+      clear_indicate_queue();
       auto self = static_cast<Esp32Ble *>(arg);
       if (self && last_adv.has_value()) {
         self->start_advertising(*last_adv, 20);
