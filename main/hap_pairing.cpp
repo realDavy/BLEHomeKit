@@ -122,41 +122,35 @@ static void hap_nvs_erase_hap_storage() {
 }
 
 void hap_wipe_legacy_nvs() {
-    const bool had_list = hap_nvs_has_pairing_list();
-    ESP_LOGW(TAG, "hap_wipe: pairing_list %s", had_list ? "PRESENT" : "absent");
-
-    nvs_handle_t boot;
-    if (nvs_open("hap_boot", NVS_READWRITE, &boot) != ESP_OK) {
-        ESP_LOGE(TAG, "hap_boot open failed");
-        if (had_list) {
-            hap_nvs_erase_hap_storage();
-        }
+    nvs_handle_t handle;
+    if (nvs_open("hap_storage", NVS_READWRITE, &handle) != ESP_OK) {
+        ESP_LOGE(TAG, "hap_storage open failed");
         return;
     }
 
-    uint8_t wipe3 = 0;
-    nvs_get_u8(boot, "wipe3", &wipe3);
-
-    if (had_list && wipe3 != 1) {
-        ESP_LOGW(TAG, "Wiping hap_storage (wipe3) so HomeKit advertises SF=1");
-        hap_nvs_erase_hap_storage();
-        if (hap_nvs_has_pairing_list()) {
-            ESP_LOGE(TAG, "pairing_list STILL present after nvs_erase_all");
-        } else {
-            ESP_LOGW(TAG, "pairing_list removed; advertising should be SF=1");
-            nvs_set_u8(boot, "wipe3", 1);
-            nvs_commit(boot);
-        }
-    } else if (had_list) {
-        ESP_LOGI(TAG, "Keeping HomeKit pairing (wipe3 already done)");
+    size_t len = 0;
+    if (nvs_get_blob(handle, "pairing_list", nullptr, &len) == ESP_OK && len > 0) {
+        std::vector<uint8_t> buf(len);
+        nvs_get_blob(handle, "pairing_list", buf.data(), &len);
+        ESP_LOGW(TAG, "Boot unpair: pairing_list (%u bytes) %.*s",
+                 static_cast<unsigned>(len), static_cast<int>(len),
+                 reinterpret_cast<const char*>(buf.data()));
     } else {
-        ESP_LOGI(TAG, "No NVS pairing_list (SF=1)");
-        if (wipe3 != 1) {
-            nvs_set_u8(boot, "wipe3", 1);
-            nvs_commit(boot);
-        }
+        ESP_LOGI(TAG, "Boot unpair: pairing_list already empty");
     }
-    nvs_close(boot);
+
+    const esp_err_t e1 = nvs_erase_key(handle, "pairing_list");
+    const esp_err_t e2 = nvs_erase_key(handle, "gsn");
+    ESP_LOGW(TAG, "Boot unpair: erase pairing_list=%s gsn=%s",
+             esp_err_to_name(e1), esp_err_to_name(e2));
+    nvs_commit(handle);
+    nvs_close(handle);
+
+    if (hap_nvs_has_pairing_list()) {
+        ESP_LOGE(TAG, "pairing_list still present, erasing hap_storage");
+        hap_nvs_erase_hap_storage();
+    }
+    ESP_LOGW(TAG, "Boot unpair done — HomeKit will advertise SF=1");
 }
 
 void hap_clear_controller_pairings(hap::platform::Storage& storage) {
@@ -177,37 +171,12 @@ void hap_clear_controller_pairings(hap::platform::Storage& storage) {
 
 bool hap_sanitize_pairings(hap::platform::Storage& storage) {
     auto list = storage.get("pairing_list");
-    if (!list || list->empty()) {
-        ESP_LOGI(TAG, "HAP pairings: none (SF=1)");
-        return false;
-    }
-
-    const std::string raw(list->begin(), list->end());
-    ESP_LOGI(TAG, "HAP pairing_list (%u bytes): %s",
-             static_cast<unsigned>(raw.size()), raw.c_str());
-
-    std::vector<std::string> ids;
-    if (!parse_pairing_ids(raw, ids) || ids.empty()) {
-        ESP_LOGW(TAG, "pairing_list is empty or invalid; advertising unpaired (SF=1)");
+    if (list && !list->empty()) {
+        const std::string raw(list->begin(), list->end());
+        ESP_LOGW(TAG, "Clearing leftover pairing_list (%u bytes): %s",
+                 static_cast<unsigned>(raw.size()), raw.c_str());
         hap_clear_controller_pairings(storage);
-        return false;
     }
-
-    bool all_ok = true;
-    for (const auto& id : ids) {
-        auto ltpk = storage.get(std::string("pairing_") + id);
-        if (!ltpk || ltpk->size() != 32) {
-            ESP_LOGW(TAG, "pairing_%s missing or not 32 bytes", id.c_str());
-            all_ok = false;
-        }
-    }
-    if (!all_ok) {
-        ESP_LOGW(TAG, "Incomplete pairings cleared; advertising unpaired (SF=1)");
-        hap_clear_controller_pairings(storage);
-        return false;
-    }
-
-    ESP_LOGI(TAG, "HAP pairings: %u valid controller(s) (SF=0)",
-             static_cast<unsigned>(ids.size()));
-    return true;
+    ESP_LOGI(TAG, "HAP pairings: none (SF=1)");
+    return false;
 }
