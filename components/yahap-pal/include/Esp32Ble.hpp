@@ -71,3 +71,8 @@ private:
   bool encrypted_adv_active_ = false;
   static void enc_adv_timer_callback(void *arg);
 };
+
+// HAP-style Generic Attribute (0x1801): Service Changed only. NimBLE's
+// ble_svc_gatt_init() also exposes Client Supported Features without
+// Database Hash, which puts Home in the change-unaware state.
+void esp32_ble_init_gatt_service();

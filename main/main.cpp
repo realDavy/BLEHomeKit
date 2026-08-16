@@ -8,7 +8,6 @@
 #include <host/ble_att.h>
 #include <nvs_flash.h>
 #include <services/gap/ble_svc_gap.h>
-#include <services/gatt/ble_svc_gatt.h>
 #include <sodium.h>
 
 #include "Esp32Ble.hpp"
@@ -196,7 +195,7 @@ extern "C" void app_main() {
     log_pairing_banner(paired, setup_code);
 
     ble_svc_gap_init();
-    ble_svc_gatt_init();
+    esp32_ble_init_gatt_service();
     ble_svc_gap_device_name_set(HAP_DEVICE_NAME);
     log_heap("after nimble_port_init");
 
@@ -322,7 +321,7 @@ extern "C" void app_main() {
         hap_sync_from_light(state);
     });
 
-    ESP_LOGW(TAG, "HomeKit sync-rev=12 — rebuild/flash this tree, not 33b40b7");
+    ESP_LOGW(TAG, "HomeKit sync-rev=13 — rebuild/flash this tree, not 33b40b7");
     ESP_LOGI(TAG, "HAP-BLE advertising as '%s', setup code %s", HAP_DEVICE_NAME, setup_code.c_str());
     log_heap("before hap start");
     server.start();

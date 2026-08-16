@@ -19,12 +19,13 @@
 #endif
 #include <cstdlib>
 #include <cstring>
+#include <host/ble_att.h>
 #include <host/ble_gap.h>
 #include <nimble/nimble_port.h>
 #include <nimble/nimble_port_freertos.h>
 #include <optional>
+#include <os/os_mbuf.h>
 #include <services/gap/ble_svc_gap.h>
-#include <services/gatt/ble_svc_gatt.h>
 #include <string>
 
 static const char *TAG = "Esp32Ble";
@@ -51,6 +52,11 @@ static bool s_svc_changed_pending = false;
 static uint16_t s_1801_start = 0;
 static uint16_t s_1801_end = 0;
 static bool s_registering_1801 = false;
+static constexpr uint8_t kGattDbRev = 13;
+static constexpr const char *kGattDbRevKey = "gatt_db_rev";
+static uint16_t s_svc_changed_val_handle = 0;
+static uint16_t s_svc_changed_range_start = 0x0001;
+static uint16_t s_svc_changed_range_end = 0xFFFF;
 // ble_gap_adv_start() can return before ble_gap_adv_active() is true.
 // The 100 ms ensure-timer then force-restarted the same payload and tore
 // down the instance Home was about to use.
@@ -253,29 +259,104 @@ static void cancel_svc_changed_indicate() {
   }
 }
 
+static bool gatt_db_rev_advertised() {
+  if (g_storage == nullptr) {
+    return false;
+  }
+  auto blob = g_storage->get(kGattDbRevKey);
+  return blob && blob->size() == 1 && (*blob)[0] == kGattDbRev;
+}
+
+static void gatt_db_rev_mark_advertised() {
+  if (g_storage == nullptr) {
+    return;
+  }
+  const uint8_t rev = kGattDbRev;
+  g_storage->set(kGattDbRevKey, std::span<const uint8_t>(&rev, 1));
+}
+
+static int hap_gatt_svc_access(uint16_t conn_handle, uint16_t attr_handle,
+                               struct ble_gatt_access_ctxt *ctxt, void *arg) {
+  (void)conn_handle;
+  (void)attr_handle;
+  (void)arg;
+  if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) {
+    return BLE_ATT_ERR_UNLIKELY;
+  }
+  const uint8_t range[4] = {
+      static_cast<uint8_t>(s_svc_changed_range_start),
+      static_cast<uint8_t>(s_svc_changed_range_start >> 8),
+      static_cast<uint8_t>(s_svc_changed_range_end),
+      static_cast<uint8_t>(s_svc_changed_range_end >> 8),
+  };
+  if (os_mbuf_append(ctxt->om, range, sizeof(range)) != 0) {
+    return BLE_ATT_ERR_INSUFFICIENT_RES;
+  }
+  return 0;
+}
+
+void esp32_ble_init_gatt_service() {
+  static ble_uuid16_t uuid_gatt_svc = BLE_UUID16_INIT(0x1801);
+  static ble_uuid16_t uuid_svc_changed = BLE_UUID16_INIT(0x2A05);
+  static struct ble_gatt_chr_def chrs[2];
+  static struct ble_gatt_svc_def svcs[2];
+  static bool inited = false;
+  if (inited) {
+    return;
+  }
+  memset(chrs, 0, sizeof(chrs));
+  memset(svcs, 0, sizeof(svcs));
+  chrs[0].uuid = &uuid_svc_changed.u;
+  chrs[0].access_cb = hap_gatt_svc_access;
+  chrs[0].val_handle = &s_svc_changed_val_handle;
+  chrs[0].flags = BLE_GATT_CHR_F_INDICATE;
+  svcs[0].type = BLE_GATT_SVC_TYPE_PRIMARY;
+  svcs[0].uuid = &uuid_gatt_svc.u;
+  svcs[0].characteristics = chrs;
+  int rc = ble_gatts_count_cfg(svcs);
+  if (rc != 0) {
+    ESP_LOGE(TAG, "HAP 0x1801 count_cfg rc=%d", rc);
+    return;
+  }
+  rc = ble_gatts_add_svcs(svcs);
+  if (rc != 0) {
+    ESP_LOGE(TAG, "HAP 0x1801 add_svcs rc=%d", rc);
+    return;
+  }
+  inited = true;
+  ESP_LOGI(TAG, "HAP 0x1801: Service Changed only (no Client Supported Features)");
+}
+
 static void svc_changed_timer_cb(void * /*arg*/) {
   s_svc_changed_pending = false;
   if (hap_advertising_pairable()) {
     ESP_LOGI(TAG, "Skip GATT Service Changed; still pairable");
     return;
   }
-  if (s_1801_start == 0 || s_1801_end < s_1801_start) {
-    ESP_LOGW(TAG, "Skip GATT Service Changed; 0x1801 range unknown");
+  if (gatt_db_rev_advertised()) {
+    ESP_LOGI(TAG, "GATT DB is static (rev=%u); not indicating Service Changed",
+             static_cast<unsigned>(kGattDbRev));
     return;
   }
-  // Bluetooth Core Vol 3 Part G 2.5.2: a caching client stays
-  // change-unaware until Service Changed is confirmed or Database Hash
-  // matches. NimBLE exposes Client Supported Features without Database
-  // Hash, so Home waits ~2.55 s then hangs up. Indicating 0x0001-0xFFFF
-  // (sync-rev=10) made Home invalidate the whole HAP cache and drop the
-  // link. Only the Generic Attribute service changed in meaning here.
-  ESP_LOGI(TAG, "Indicating GATT Service Changed (0x%04X-0x%04X) for 0x1801",
-           s_1801_start, s_1801_end);
-  ble_svc_gatt_changed(s_1801_start, s_1801_end);
+  if (s_svc_changed_val_handle == 0) {
+    ESP_LOGW(TAG, "Skip GATT Service Changed; value handle unknown");
+    return;
+  }
+  // This firmware removed NimBLE's CSF/SSF from 0x1801, so HAP handles
+  // moved. Indicate 0x0001-0xFFFF once so Home drops the old cache, then
+  // never again (a static DB must not claim it changed on every connect).
+  s_svc_changed_range_start = 0x0001;
+  s_svc_changed_range_end = 0xFFFF;
+  ESP_LOGI(TAG,
+           "Indicating GATT Service Changed (0x0001-0xFFFF) once for 0x1801 layout rev=%u",
+           static_cast<unsigned>(kGattDbRev));
+  ble_gatts_chr_updated(s_svc_changed_val_handle);
+  gatt_db_rev_mark_advertised();
 }
 
 static void schedule_svc_changed_indicate() {
-  if (s_svc_changed_pending || hap_advertising_pairable()) {
+  if (s_svc_changed_pending || hap_advertising_pairable() ||
+      gatt_db_rev_advertised()) {
     return;
   }
   s_svc_changed_pending = true;
@@ -1212,20 +1293,24 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
           break;
         }
       }
-      // attr=11 is GATT Service Changed. A caching client (Home writes
-      // Client Supported Features) stays change-unaware until this
-      // indication is confirmed. Restrict the range to 0x1801 so HAP
-      // characteristic handles stay cached. Never do this during Add
-      // Accessory (it aborted Pair-Verify).
+      // attr=11 is GATT Service Changed. NimBLE's 0x1801 also exposes
+      // Client Supported Features without Database Hash, which put Home
+      // in the change-unaware state. This firmware's 0x1801 is Service
+      // Changed only (static HAP DB). Indicate 0x0001-0xFFFF once so a
+      // hub that cached the old 0x1801 rediscovers, then never again.
       if (!matched) {
         if (event->subscribe.cur_indicate) {
           if (hap_advertising_pairable()) {
             ESP_LOGI(TAG,
                      "Subscribe unmatched attr=%d; skip Service Changed while pairable",
                      event->subscribe.attr_handle);
+          } else if (gatt_db_rev_advertised()) {
+            ESP_LOGI(TAG,
+                     "Subscribe unmatched attr=%d; GATT DB static, not indicating",
+                     event->subscribe.attr_handle);
           } else {
             ESP_LOGI(TAG,
-                     "Subscribe unmatched attr=%d (Service Changed); will indicate 0x1801",
+                     "Subscribe unmatched attr=%d (Service Changed); one-shot 0x0001-0xFFFF",
                      event->subscribe.attr_handle);
             schedule_svc_changed_indicate();
           }
