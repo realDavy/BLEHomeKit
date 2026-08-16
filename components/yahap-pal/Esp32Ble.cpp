@@ -523,7 +523,7 @@ Esp32Ble::Esp32Ble(hap::platform::Storage *storage) : storage_(storage) {
                                     void *arg) {
     char buf[BLE_UUID_STR_LEN];
     switch (ctxt->op) {
-    case BLE_GATT_REGISTER_OP_SVC:
+    case BLE_GATT_REGISTER_OP_SVC: {
       ESP_LOGI(TAG, "Reg Service: %s, handle=%d",
                ble_uuid_to_str(ctxt->svc.svc_def->uuid, buf), ctxt->svc.handle);
       const bool was_1801 = s_registering_1801;
@@ -540,6 +540,7 @@ Esp32Ble::Esp32Ble(hap::platform::Storage *storage) : storage_(storage) {
                  s_1801_end);
       }
       break;
+    }
     case BLE_GATT_REGISTER_OP_CHR:
       ESP_LOGI(TAG, "Reg Char: %s, val_handle=%d",
                ble_uuid_to_str(ctxt->chr.chr_def->uuid, buf),
