@@ -356,7 +356,7 @@ void BleTransport::start() {
     if (!config_.ble) return;
 
     config_.system->log(platform::System::LogLevel::Info,
-        "[BleTransport] Starting sync-rev=11 (HAP 7.4.1.4: no ads while connected)");
+        "[BleTransport] Starting sync-rev=12 (0x1801 Service Changed; no ads while connected)");
 
     config_.ble->set_disconnect_callback([this](uint16_t connection_id) {
         config_.system->log(platform::System::LogLevel::Info, 
