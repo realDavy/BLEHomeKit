@@ -356,7 +356,7 @@ void BleTransport::start() {
     if (!config_.ble) return;
 
     config_.system->log(platform::System::LogLevel::Info,
-        "[BleTransport] Starting sync-rev=9 (indicate after HAP-BLE is idle)");
+        "[BleTransport] Starting sync-rev=10 (paired Service Changed; idle indicate)");
 
     config_.ble->set_disconnect_callback([this](uint16_t connection_id) {
         config_.system->log(platform::System::LogLevel::Info, 

@@ -24,6 +24,7 @@
 #include <nimble/nimble_port_freertos.h>
 #include <optional>
 #include <services/gap/ble_svc_gap.h>
+#include <services/gatt/ble_svc_gatt.h>
 #include <string>
 
 static const char *TAG = "Esp32Ble";
@@ -46,6 +47,9 @@ static bool s_need_adv_after_conn = false;
 static bool s_rnd_addr_ready = false;
 static esp_timer_handle_t s_adv_ensure_timer = nullptr;
 static int s_adv_ensure_pass = 0;
+static esp_timer_handle_t s_svc_changed_timer = nullptr;
+static bool s_svc_changed_pending = false;
+static bool s_hap_gatt_seen = false;
 // ble_gap_adv_start() can return before ble_gap_adv_active() is true.
 // The 100 ms ensure-timer then force-restarted the same payload and tore
 // down the instance Home was about to use.
@@ -239,6 +243,53 @@ static void use_hap_static_random_addr() {
 }
 
 static void force_start_last_adv(const char *why);
+static bool hap_advertising_pairable();
+
+static void cancel_svc_changed_indicate() {
+  s_svc_changed_pending = false;
+  if (s_svc_changed_timer != nullptr) {
+    esp_timer_stop(s_svc_changed_timer);
+  }
+}
+
+static void svc_changed_timer_cb(void * /*arg*/) {
+  s_svc_changed_pending = false;
+  if (s_hap_gatt_seen) {
+    ESP_LOGI(TAG, "Skip GATT Service Changed; HAP-BLE already started");
+    return;
+  }
+  if (hap_advertising_pairable()) {
+    ESP_LOGI(TAG, "Skip GATT Service Changed; still pairable");
+    return;
+  }
+  ESP_LOGI(TAG, "Indicating GATT Service Changed (0x0001-0xFFFF)");
+  ble_svc_gatt_changed(0x0001, 0xffff);
+}
+
+static void schedule_svc_changed_indicate() {
+  if (s_svc_changed_pending || s_hap_gatt_seen || hap_advertising_pairable()) {
+    return;
+  }
+  s_svc_changed_pending = true;
+  if (s_svc_changed_timer == nullptr) {
+    const esp_timer_create_args_t args = {
+        .callback = svc_changed_timer_cb,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "svc_chg",
+        .skip_unhandled_events = true,
+    };
+    if (esp_timer_create(&args, &s_svc_changed_timer) != ESP_OK) {
+      s_svc_changed_timer = nullptr;
+      ESP_LOGW(TAG, "Failed to create Service Changed timer");
+      svc_changed_timer_cb(nullptr);
+      return;
+    }
+  }
+  esp_timer_stop(s_svc_changed_timer);
+  // Let the CCCD write complete. If Home starts HAP-BLE first, cancel.
+  esp_timer_start_once(s_svc_changed_timer, 50000);
+}
 
 static bool hap_payload_pairable(const hap::platform::Ble::Advertisement &data) {
   return data.manufacturer_data.size() >= 3 && data.manufacturer_data[0] == 0x06 &&
@@ -839,6 +890,8 @@ int Esp32Ble::gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
     return BLE_ATT_ERR_UNLIKELY;
 
   ++s_gatt_access_depth;
+  s_hap_gatt_seen = true;
+  cancel_svc_changed_indicate();
   int result = 0;
 
   if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
@@ -1060,6 +1113,8 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
       // keeps the radio on this GATT link until hangup. Paired reconnect
       // restores ads after the first CONN_UPDATE (sync-rev=3).
       s_hold_adv_for_gatt = true;
+      s_hap_gatt_seen = false;
+      cancel_svc_changed_indicate();
       if (hap_advertising_pairable()) {
         s_need_adv_after_conn = false;
         ESP_LOGI(TAG, "Unpaired Pair-Setup: hold advertising while connected");
@@ -1105,6 +1160,8 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
     {
       s_hold_adv_for_gatt = false;
       s_need_adv_after_conn = false;
+      cancel_svc_changed_indicate();
+      s_hap_gatt_seen = false;
       clear_indicate_queue();
       auto self = static_cast<Esp32Ble *>(arg);
       // Do not start advertising here. NimBLE is still cleaning up the
@@ -1138,9 +1195,20 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
           break;
         }
       }
-      // attr=11 is GATT Service Changed. HAP-BLE uses GSN for state
-      // changes; indicating a GATT DB change makes iOS abort Pair-Verify.
-      if (!matched) {
+      // attr=11 is GATT Service Changed. Unpaired Add Accessory must
+      // not get this indication (it aborted Pair-Verify). A paired
+      // Home hub writes the CCCD then waits ~2.5 s for 0x0001-0xFFFF
+      // before rediscovering; without it the session is attr=11 only.
+      if (!matched && event->subscribe.cur_indicate) {
+        if (hap_advertising_pairable()) {
+          ESP_LOGI(TAG, "Subscribe unmatched attr=%d; skip Service Changed while pairable",
+                   event->subscribe.attr_handle);
+        } else {
+          ESP_LOGI(TAG, "Subscribe unmatched attr=%d (Service Changed); will indicate GATT range",
+                   event->subscribe.attr_handle);
+          schedule_svc_changed_indicate();
+        }
+      } else if (!matched) {
         ESP_LOGI(TAG, "Subscribe unmatched attr=%d",
                  event->subscribe.attr_handle);
       }
