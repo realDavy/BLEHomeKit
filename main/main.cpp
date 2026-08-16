@@ -321,7 +321,7 @@ extern "C" void app_main() {
         hap_sync_from_light(state);
     });
 
-    ESP_LOGW(TAG, "HomeKit sync-rev=13 — rebuild/flash this tree, not 33b40b7");
+    ESP_LOGW(TAG, "HomeKit sync-rev=14 — rebuild/flash this tree, not 33b40b7");
     ESP_LOGI(TAG, "HAP-BLE advertising as '%s', setup code %s", HAP_DEVICE_NAME, setup_code.c_str());
     log_heap("before hap start");
     server.start();

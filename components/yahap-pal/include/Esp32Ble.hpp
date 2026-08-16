@@ -72,7 +72,7 @@ private:
   static void enc_adv_timer_callback(void *arg);
 };
 
-// HAP-style Generic Attribute (0x1801): Service Changed only. NimBLE's
-// ble_svc_gatt_init() also exposes Client Supported Features without
-// Database Hash, which puts Home in the change-unaware state.
+// Logs that Generic Attribute (0x1801) is omitted. This accessory's HAP
+// GATT database is static, so Service Changed is not required (Bluetooth
+// Core Vol 3 Part G 7.1). NimBLE's ble_svc_gatt_init() always adds it.
 void esp32_ble_init_gatt_service();
