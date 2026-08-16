@@ -24,7 +24,6 @@
 #include <nimble/nimble_port_freertos.h>
 #include <optional>
 #include <services/gap/ble_svc_gap.h>
-#include <services/gatt/ble_svc_gatt.h>
 #include <string>
 
 static const char *TAG = "Esp32Ble";
@@ -43,9 +42,8 @@ static uint32_t last_adv_interval = 20;
 static uint16_t s_ble_conns = 0;
 static bool s_force_adv_restart = false;
 static bool s_hold_adv_for_gatt = false;
+static bool s_need_adv_after_conn = false;
 static bool s_rnd_addr_ready = false;
-static bool s_svc_changed_pending = false;
-static esp_timer_handle_t s_svc_changed_timer = nullptr;
 static esp_timer_handle_t s_adv_ensure_timer = nullptr;
 static int s_adv_ensure_pass = 0;
 // ble_gap_adv_start() can return before ble_gap_adv_active() is true.
@@ -236,36 +234,6 @@ static void use_hap_static_random_addr() {
 }
 
 static void force_start_last_adv(const char *why);
-
-static void svc_changed_timer_cb(void * /*arg*/) {
-  ESP_LOGI(TAG, "Indicating GATT Service Changed (0x0001-0xFFFF)");
-  ble_svc_gatt_changed(0x0001, 0xffff);
-}
-
-static void schedule_svc_changed_indicate() {
-  if (s_svc_changed_pending) {
-    return;
-  }
-  s_svc_changed_pending = true;
-  if (s_svc_changed_timer == nullptr) {
-    const esp_timer_create_args_t args = {
-        .callback = svc_changed_timer_cb,
-        .arg = nullptr,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "svc_chg",
-        .skip_unhandled_events = true,
-    };
-    if (esp_timer_create(&args, &s_svc_changed_timer) != ESP_OK) {
-      s_svc_changed_timer = nullptr;
-      ESP_LOGW(TAG, "Failed to create Service Changed timer");
-      svc_changed_timer_cb(nullptr);
-      return;
-    }
-  }
-  esp_timer_stop(s_svc_changed_timer);
-  // Let the CCCD write complete before the indication, or iOS misses it.
-  esp_timer_start_once(s_svc_changed_timer, 50000);
-}
 
 static bool adv_start_in_flight() {
   if (ble_gap_adv_active() || s_last_adv_start_us == 0) {
@@ -593,15 +561,19 @@ void Esp32Ble::start_advertising(const Advertisement &data,
 
   const int rc = ble_gap_adv_start(g_own_addr_type, NULL, BLE_HS_FOREVER,
                                    &adv_params, ble_gap_event, this);
-  if (rc != 0) {
-    ESP_LOGE(TAG, "error enabling advertisement; rc=%d", rc);
-    s_last_adv_start_us = 0;
-  } else {
-    ESP_LOGI(TAG, "Advertising started");
+  if (rc == 0 || rc == BLE_HS_EALREADY) {
+    if (rc == BLE_HS_EALREADY) {
+      ESP_LOGI(TAG, "Advertising already enabled");
+    } else {
+      ESP_LOGI(TAG, "Advertising started");
+    }
     last_adv = data;
     last_adv_interval = interval_ms;
     s_last_adv_start_us = esp_timer_get_time();
     log_adv_identity(data);
+  } else {
+    ESP_LOGE(TAG, "error enabling advertisement; rc=%d", rc);
+    s_last_adv_start_us = 0;
   }
 }
 
@@ -1039,19 +1011,16 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
           self->enc_adv_timer_ = nullptr;
         }
       }
-      // Do not restart advertising here. Keep the radio on GATT until
-      // Pair-Verify. After Service Changed subscribe we indicate the
-      // full handle range so iOS will rediscover and Pair-Verify.
+      // Do not restart advertising in CONNECT: that races with
+      // ble_gap_update_params (llc_con_upd assert). Hold until the first
+      // CONN_UPDATE, then restore ads the way sync-rev=3 did.
       s_hold_adv_for_gatt = true;
-      s_svc_changed_pending = false;
-      if (s_svc_changed_timer != nullptr) {
-        esp_timer_stop(s_svc_changed_timer);
-      }
+      s_need_adv_after_conn = true;
       if (s_ble_conns >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
         ESP_LOGI(TAG, "At max BLE links (%u); advertising after a drop",
                  static_cast<unsigned>(s_ble_conns));
       } else {
-        ESP_LOGI(TAG, "Hold advertising until Pair-Verify");
+        ESP_LOGI(TAG, "Hold advertising until first connection-parameter update");
       }
     }
     break;
@@ -1086,10 +1055,7 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
              event->disconnect.reason, static_cast<unsigned>(s_ble_conns));
     {
       s_hold_adv_for_gatt = false;
-      s_svc_changed_pending = false;
-      if (s_svc_changed_timer != nullptr) {
-        esp_timer_stop(s_svc_changed_timer);
-      }
+      s_need_adv_after_conn = false;
       clear_indicate_queue();
       auto self = static_cast<Esp32Ble *>(arg);
       // Do not start advertising here. NimBLE is still cleaning up the
@@ -1123,13 +1089,11 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
           break;
         }
       }
-      // iOS writes the GATT Service Changed CCCD then waits for an
-      // indication before rediscovering. We never sent one, so Home
-      // sat on attr=11 for ~2.5 s and hung up with no Pair-Verify.
-      if (!matched && event->subscribe.cur_indicate) {
-        ESP_LOGI(TAG, "Subscribe unmatched attr=%d (Service Changed); will indicate GATT range",
+      // attr=11 is GATT Service Changed. HAP-BLE uses GSN for state
+      // changes; indicating a GATT DB change makes iOS abort Pair-Verify.
+      if (!matched) {
+        ESP_LOGI(TAG, "Subscribe unmatched attr=%d",
                  event->subscribe.attr_handle);
-        schedule_svc_changed_indicate();
       }
     }
     break;
@@ -1139,6 +1103,11 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
     break;
   case BLE_GAP_EVENT_CONN_UPDATE:
     ESP_LOGI(TAG, "Connection Update: conn=%d", event->conn_update.conn_handle);
+    if (s_need_adv_after_conn) {
+      s_need_adv_after_conn = false;
+      s_hold_adv_for_gatt = false;
+      restart_adv_for_new_link("conn-update");
+    }
     break;
   case BLE_GAP_EVENT_CONN_UPDATE_REQ:
     ESP_LOGI(TAG, "Connection Update Request: conn=%d (accept)",
