@@ -42,6 +42,8 @@ static uint32_t pending_adv_interval = 0;
 static uint32_t last_adv_interval = 20;
 static uint16_t s_ble_conns = 0;
 static bool s_force_adv_restart = false;
+static bool s_hold_adv_for_gatt = false;
+static bool s_rnd_addr_ready = false;
 static esp_timer_handle_t s_adv_ensure_timer = nullptr;
 static int s_adv_ensure_pass = 0;
 // ble_gap_adv_start() can return before ble_gap_adv_active() is true.
@@ -62,8 +64,6 @@ static int s_indicate_start_depth = 0;
 static std::vector<QueuedIndicate> s_indicate_q;
 static esp_timer_handle_t s_indicate_watchdog = nullptr;
 static esp_timer_handle_t s_indicate_retry = nullptr;
-static bool s_restart_adv_after_conn_upd = false;
-static esp_timer_handle_t s_adv_after_conn_timer = nullptr;
 
 static void flush_indicate_queue();
 static void schedule_indicate_retry();
@@ -196,6 +196,9 @@ static void flush_indicate_queue() {
 // address must match the HAP Device ID so iPhone can reconnect after
 // Pair-Setup (public + random-rotating both show up as 未响应).
 static void use_hap_static_random_addr() {
+  if (s_rnd_addr_ready && g_own_addr_type == BLE_OWN_ADDR_RANDOM) {
+    return;
+  }
   uint8_t rnd[6] = {};
   bool have_id = false;
   if (g_storage) {
@@ -227,6 +230,7 @@ static void use_hap_static_random_addr() {
     return;
   }
   g_own_addr_type = BLE_OWN_ADDR_RANDOM;
+  s_rnd_addr_ready = true;
 }
 
 static void force_start_last_adv(const char *why);
@@ -241,6 +245,10 @@ static bool adv_start_in_flight() {
 static void adv_ensure_timer_cb(void *arg) {
   (void)arg;
   if (!last_adv.has_value() || g_ble_instance == nullptr) {
+    return;
+  }
+  if (s_ble_conns > 0 || s_hold_adv_for_gatt) {
+    ESP_LOGI(TAG, "Skip ensure-timer; link is up (pass %d)", s_adv_ensure_pass);
     return;
   }
   if (ble_gap_adv_active()) {
@@ -284,6 +292,10 @@ static void schedule_adv_ensure() {
 }
 
 static void force_start_last_adv(const char *why) {
+  if (s_hold_adv_for_gatt) {
+    ESP_LOGI(TAG, "Defer advertising (%s): wait for Pair-Verify", why);
+    return;
+  }
   if (g_ble_instance == nullptr || !last_adv.has_value()) {
     ESP_LOGW(TAG, "Cannot restart advertising (%s): no last payload", why);
     return;
@@ -294,52 +306,17 @@ static void force_start_last_adv(const char *why) {
   g_ble_instance->start_advertising(*last_adv, interval);
 }
 
-static void cancel_adv_after_conn() {
-  s_restart_adv_after_conn_upd = false;
-  if (s_adv_after_conn_timer != nullptr) {
-    esp_timer_stop(s_adv_after_conn_timer);
-  }
-}
-
 static void restart_adv_for_new_link(const char *why) {
+  if (s_hold_adv_for_gatt) {
+    ESP_LOGI(TAG, "Defer advertising (%s): wait for Pair-Verify", why);
+    return;
+  }
   if (s_ble_conns >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
     ESP_LOGI(TAG, "Skip advertising (%s): at max links %u", why,
              static_cast<unsigned>(s_ble_conns));
     return;
   }
   force_start_last_adv(why);
-}
-
-static void adv_after_conn_cb(void * /*arg*/) {
-  if (!s_restart_adv_after_conn_upd) {
-    return;
-  }
-  s_restart_adv_after_conn_upd = false;
-  ESP_LOGI(TAG, "Starting advertising after connection-update wait");
-  restart_adv_for_new_link("after-conn-upd-timeout");
-}
-
-static void schedule_adv_after_conn() {
-  s_restart_adv_after_conn_upd = true;
-  if (s_adv_after_conn_timer == nullptr) {
-    const esp_timer_create_args_t args = {
-        .callback = adv_after_conn_cb,
-        .arg = nullptr,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "adv_conn",
-        .skip_unhandled_events = true,
-    };
-    if (esp_timer_create(&args, &s_adv_after_conn_timer) != ESP_OK) {
-      s_adv_after_conn_timer = nullptr;
-      ESP_LOGW(TAG, "Failed to create post-connect advertising timer; "
-                    "will start advertising on CONN_UPDATE");
-      return;
-    }
-  }
-  esp_timer_stop(s_adv_after_conn_timer);
-  // CONN_UPDATE usually arrives within one interval (~20–60 ms). This is
-  // only a fallback if the controller never emits the event.
-  esp_timer_start_once(s_adv_after_conn_timer, 400 * 1000);
 }
 
 static void log_adv_identity(const hap::platform::Ble::Advertisement &data) {
@@ -522,6 +499,10 @@ void Esp32Ble::start_advertising(const Advertisement &data,
   if (interval_ms > 20) {
     interval_ms = 20;
   }
+
+  // HAP asked to advertise (Pair-Verify SF=0, disconnected GSN). The
+  // radio is free for GAP again.
+  s_hold_adv_for_gatt = false;
 
   const bool same_payload =
       last_adv.has_value() && last_adv_interval == interval_ms &&
@@ -1026,18 +1007,16 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
           self->enc_adv_timer_ = nullptr;
         }
       }
-      // Keep advertising while there is a free connection slot so a second
-      // controller can join. Do not start advertising in this same CONNECT
-      // callback as ble_gap_update_params — that races the controller
-      // (llc_con_upd.c assert) and returns BLE_HS_ENOMEM at max links.
+      // Keep the controller on GATT until Pair-Verify. Restarting
+      // advertising ~60 ms after CONNECT (on CONN_UPDATE) made Home
+      // subscribe to Service Changed and time out at ~2.5 s with no
+      // Pair-Verify and no characteristic CCCDs.
+      s_hold_adv_for_gatt = true;
       if (s_ble_conns >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
-        cancel_adv_after_conn();
         ESP_LOGI(TAG, "At max BLE links (%u); advertising after a drop",
                  static_cast<unsigned>(s_ble_conns));
-      } else if (rc != 0) {
-        restart_adv_for_new_link("connect-no-upd");
       } else {
-        schedule_adv_after_conn();
+        ESP_LOGI(TAG, "Hold advertising until Pair-Verify");
       }
     }
     break;
@@ -1071,7 +1050,7 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
     ESP_LOGI(TAG, "Disconnected, reason=0x%x links=%u",
              event->disconnect.reason, static_cast<unsigned>(s_ble_conns));
     {
-      cancel_adv_after_conn();
+      s_hold_adv_for_gatt = false;
       clear_indicate_queue();
       auto self = static_cast<Esp32Ble *>(arg);
       // Do not start advertising here. NimBLE is still cleaning up the
@@ -1109,10 +1088,6 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
     break;
   case BLE_GAP_EVENT_CONN_UPDATE:
     ESP_LOGI(TAG, "Connection Update: conn=%d", event->conn_update.conn_handle);
-    if (s_restart_adv_after_conn_upd) {
-      cancel_adv_after_conn();
-      restart_adv_for_new_link("conn-update");
-    }
     break;
   case BLE_GAP_EVENT_CONN_UPDATE_REQ:
     ESP_LOGI(TAG, "Connection Update Request: conn=%d (accept)",

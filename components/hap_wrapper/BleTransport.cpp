@@ -322,7 +322,7 @@ void BleTransport::start() {
     if (!config_.ble) return;
 
     config_.system->log(platform::System::LogLevel::Info,
-        "[BleTransport] Starting sync-rev=4 (new adv instance only when GSN changes; no same-GSN hangup restart)");
+        "[BleTransport] Starting sync-rev=5 (quiet GATT until Pair-Verify; new adv instance only on GSN change)");
 
     config_.ble->set_disconnect_callback([this](uint16_t connection_id) {
         config_.system->log(platform::System::LogLevel::Info, 
