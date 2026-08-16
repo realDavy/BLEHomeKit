@@ -1,17 +1,17 @@
 // Local overlay of hap/src/transport/BleTransport.cpp:
 // fragment HAP-BLE GATT reads to ATT MTU, do not apply the 10s
 // procedure timeout while waiting for the next pair-setup write,
-// keep SF=1 until Pair-Verify then push SF=0 immediately (Home scans
-// for the paired accessory while still connected), do not register an
-// empty 0xFE59 GATT service, send Connected Events immediately (NimBLE
-// coalesces in-flight indications by attr_handle and waits for the
-// peer confirm before the next ATT procedure), advertise one GSN per
-// disconnected knob burst and a separate hangup GSN so a later
-// gesture is not swallowed (HAP 7.4.6.1 vs 7.4.6.3), push current
-// On/Brightness/CT after the Pair-Verify GATT response has been
-// fully read (not on the write that prepares it), hold local events
-// while a HAP-BLE PDU is in flight, do not treat a Home write as
-// "still pairing" just because the writer is the only subscriber,
+// keep SF=1 until Pair-Verify then stash SF=0 for after hangup
+// (HAP R14 7.4.1.4: do not advertise while a controller is connected),
+// do not register an empty 0xFE59 GATT service, send Connected Events
+// immediately (NimBLE coalesces in-flight indications by attr_handle
+// and waits for the peer confirm before the next ATT procedure),
+// advertise one GSN per disconnected knob burst and a separate hangup
+// GSN so a later gesture is not swallowed (HAP 7.4.6.1 vs 7.4.6.3),
+// push current On/Brightness/CT after the Pair-Verify GATT response
+// has been fully read (not on the write that prepares it), hold local
+// events while a HAP-BLE PDU is in flight, do not treat a Home write
+// as "still pairing" just because the writer is the only subscriber,
 // avoid 500 ms advertising after drop, and disconnect after Home
 // RemovePairing so advertising returns to SF=1.
 #include "hap/transport/BleTransport.hpp"
@@ -124,7 +124,7 @@ static bool hap_note_pair_verify_done(hap::platform::Storage* storage, hap::plat
     s_gsn_on_first_verify_drop = true;
     if (system) {
         system->log(hap::platform::System::LogLevel::Info,
-            "[BleTransport] Pair-Verify succeeded; advertise SF=0 while still connected");
+            "[BleTransport] Pair-Verify succeeded; SF=0 after this connection hangs up");
     }
     return true;
 }
@@ -356,7 +356,7 @@ void BleTransport::start() {
     if (!config_.ble) return;
 
     config_.system->log(platform::System::LogLevel::Info,
-        "[BleTransport] Starting sync-rev=10 (paired Service Changed; idle indicate)");
+        "[BleTransport] Starting sync-rev=11 (HAP 7.4.1.4: no ads while connected)");
 
     config_.ble->set_disconnect_callback([this](uint16_t connection_id) {
         config_.system->log(platform::System::LogLevel::Info, 
@@ -702,9 +702,8 @@ void BleTransport::setup_protocol_info_service() {
 }
 
 void BleTransport::update_advertising() {
-    // Do not defer while connected. After Pair-Verify, Home scans for SF=0
-    // during the still-connected Add Accessory session. Esp32Ble updates
-    // the payload in place so this does not stop advertising.
+    // Esp32Ble defers while a controller is connected (HAP 7.4.1.4).
+    // After Pair-Verify this stashes SF=0 for the hangup advertisement.
     config_.system->log(platform::System::LogLevel::Info, "[BleTransport] update_advertising entry");
     
     auto setup_id_bytes = config_.storage->get("setup_id");
@@ -1293,10 +1292,9 @@ void BleTransport::process_transaction(uint16_t connection_id, TransactionState&
              } else if (type == 0x4E) { // Pair Verify
                 req.path = "/pair-verify";
                 resp = config_.pairing_endpoints->handle_pair_verify(req, ctx);
-                if (hap_note_pair_verify_done(config_.storage, config_.system, ctx.is_encrypted())) {
-                    hap_schedule_paired_advertising(this, config_.scheduler);
-                }
+                hap_note_pair_verify_done(config_.storage, config_.system, ctx.is_encrypted());
                 if (ctx.is_encrypted()) {
+                    hap_schedule_paired_advertising(this, config_.scheduler);
                     // Home still has to GATT-Read this Pair-Verify response.
                     s_pending_state_push = true;
                 }
@@ -1509,10 +1507,9 @@ void BleTransport::process_transaction(uint16_t connection_id, TransactionState&
                 } else if (type == 0x4E) {
                     req.path = "/pair-verify";
                     resp = config_.pairing_endpoints->handle_pair_verify(req, ctx);
-                    if (hap_note_pair_verify_done(config_.storage, config_.system, ctx.is_encrypted())) {
-                        hap_schedule_paired_advertising(this, config_.scheduler);
-                    }
+                    hap_note_pair_verify_done(config_.storage, config_.system, ctx.is_encrypted());
                     if (ctx.is_encrypted()) {
+                        hap_schedule_paired_advertising(this, config_.scheduler);
                         HAP_SCHEDULE_PUSH_CURRENT_STATE();
                     }
                 } else if (type == 0x50) {
@@ -1837,10 +1834,9 @@ bool BleTransport::process_characteristic_write(uint16_t connection_id, uint16_t
         req.path = "/pair-verify";
         
         auto resp = config_.pairing_endpoints->handle_pair_verify(req, *session.context);
-        if (hap_note_pair_verify_done(config_.storage, config_.system, session.context->is_encrypted())) {
-            hap_schedule_paired_advertising(this, config_.scheduler);
-        }
+        hap_note_pair_verify_done(config_.storage, config_.system, session.context->is_encrypted());
         if (session.context->is_encrypted()) {
+            hap_schedule_paired_advertising(this, config_.scheduler);
             // Home still has to GATT-Read this Pair-Verify response.
             s_pending_state_push = true;
         }

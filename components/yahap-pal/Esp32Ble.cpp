@@ -24,7 +24,6 @@
 #include <nimble/nimble_port_freertos.h>
 #include <optional>
 #include <services/gap/ble_svc_gap.h>
-#include <services/gatt/ble_svc_gatt.h>
 #include <string>
 
 static const char *TAG = "Esp32Ble";
@@ -43,13 +42,9 @@ static uint32_t last_adv_interval = 20;
 static uint16_t s_ble_conns = 0;
 static bool s_force_adv_restart = false;
 static bool s_hold_adv_for_gatt = false;
-static bool s_need_adv_after_conn = false;
 static bool s_rnd_addr_ready = false;
 static esp_timer_handle_t s_adv_ensure_timer = nullptr;
 static int s_adv_ensure_pass = 0;
-static esp_timer_handle_t s_svc_changed_timer = nullptr;
-static bool s_svc_changed_pending = false;
-static bool s_hap_gatt_seen = false;
 // ble_gap_adv_start() can return before ble_gap_adv_active() is true.
 // The 100 ms ensure-timer then force-restarted the same payload and tore
 // down the instance Home was about to use.
@@ -244,52 +239,6 @@ static void use_hap_static_random_addr() {
 
 static void force_start_last_adv(const char *why);
 static bool hap_advertising_pairable();
-
-static void cancel_svc_changed_indicate() {
-  s_svc_changed_pending = false;
-  if (s_svc_changed_timer != nullptr) {
-    esp_timer_stop(s_svc_changed_timer);
-  }
-}
-
-static void svc_changed_timer_cb(void * /*arg*/) {
-  s_svc_changed_pending = false;
-  if (s_hap_gatt_seen) {
-    ESP_LOGI(TAG, "Skip GATT Service Changed; HAP-BLE already started");
-    return;
-  }
-  if (hap_advertising_pairable()) {
-    ESP_LOGI(TAG, "Skip GATT Service Changed; still pairable");
-    return;
-  }
-  ESP_LOGI(TAG, "Indicating GATT Service Changed (0x0001-0xFFFF)");
-  ble_svc_gatt_changed(0x0001, 0xffff);
-}
-
-static void schedule_svc_changed_indicate() {
-  if (s_svc_changed_pending || s_hap_gatt_seen || hap_advertising_pairable()) {
-    return;
-  }
-  s_svc_changed_pending = true;
-  if (s_svc_changed_timer == nullptr) {
-    const esp_timer_create_args_t args = {
-        .callback = svc_changed_timer_cb,
-        .arg = nullptr,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "svc_chg",
-        .skip_unhandled_events = true,
-    };
-    if (esp_timer_create(&args, &s_svc_changed_timer) != ESP_OK) {
-      s_svc_changed_timer = nullptr;
-      ESP_LOGW(TAG, "Failed to create Service Changed timer");
-      svc_changed_timer_cb(nullptr);
-      return;
-    }
-  }
-  esp_timer_stop(s_svc_changed_timer);
-  // Let the CCCD write complete. If Home starts HAP-BLE first, cancel.
-  esp_timer_start_once(s_svc_changed_timer, 50000);
-}
 
 static bool hap_payload_pairable(const hap::platform::Ble::Advertisement &data) {
   return data.manufacturer_data.size() >= 3 && data.manufacturer_data[0] == 0x06 &&
@@ -565,13 +514,15 @@ void Esp32Ble::start_advertising(const Advertisement &data,
     interval_ms = 20;
   }
 
-  // Pair-Setup stays on this GATT link. Stop/start (or a Service Changed
-  // indicate) is what made Home show 失去连接. Keep the new payload for
-  // after hangup. SF=0 after Pair-Verify must still go on the air.
-  if (s_ble_conns > 0 && hap_payload_pairable(data) && !s_force_adv_restart) {
+  // HAP R14 7.4.1.4 / Apple HomeKit ADK: the accessory shall not
+  // advertise while connected to a HomeKit controller. Stop/start (or a
+  // Service Changed indicate) while Home is on this link is what aborted
+  // Pair-Verify. Stash SF / GSN for after hangup.
+  if (s_ble_conns > 0) {
     last_adv = data;
     last_adv_interval = interval_ms;
-    ESP_LOGI(TAG, "Defer advertising (Pair-Setup in progress)");
+    s_force_adv_restart = false;
+    ESP_LOGI(TAG, "Defer advertising (HAP 7.4.1.4: controller connected)");
     return;
   }
 
@@ -890,8 +841,6 @@ int Esp32Ble::gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
     return BLE_ATT_ERR_UNLIKELY;
 
   ++s_gatt_access_depth;
-  s_hap_gatt_seen = true;
-  cancel_svc_changed_indicate();
   int result = 0;
 
   if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
@@ -1108,23 +1057,17 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
           self->enc_adv_timer_ = nullptr;
         }
       }
-      // Do not restart advertising in CONNECT: that races with
-      // ble_gap_update_params (llc_con_upd assert). Unpaired Pair-Setup
-      // keeps the radio on this GATT link until hangup. Paired reconnect
-      // restores ads after the first CONN_UPDATE (sync-rev=3).
+      // Do not start advertising in CONNECT: that races with
+      // ble_gap_update_params (llc_con_upd assert). HAP R14 7.4.1.4:
+      // do not advertise at all while a controller is connected.
       s_hold_adv_for_gatt = true;
-      s_hap_gatt_seen = false;
-      cancel_svc_changed_indicate();
       if (hap_advertising_pairable()) {
-        s_need_adv_after_conn = false;
         ESP_LOGI(TAG, "Unpaired Pair-Setup: hold advertising while connected");
       } else if (s_ble_conns >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
-        s_need_adv_after_conn = false;
         ESP_LOGI(TAG, "At max BLE links (%u); advertising after a drop",
                  static_cast<unsigned>(s_ble_conns));
       } else {
-        s_need_adv_after_conn = true;
-        ESP_LOGI(TAG, "Hold advertising until first connection-parameter update");
+        ESP_LOGI(TAG, "Paired reconnect: hold advertising until hangup (HAP 7.4.1.4)");
       }
     }
     break;
@@ -1159,9 +1102,6 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
              event->disconnect.reason, static_cast<unsigned>(s_ble_conns));
     {
       s_hold_adv_for_gatt = false;
-      s_need_adv_after_conn = false;
-      cancel_svc_changed_indicate();
-      s_hap_gatt_seen = false;
       clear_indicate_queue();
       auto self = static_cast<Esp32Ble *>(arg);
       // Do not start advertising here. NimBLE is still cleaning up the
@@ -1195,22 +1135,20 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
           break;
         }
       }
-      // attr=11 is GATT Service Changed. Unpaired Add Accessory must
-      // not get this indication (it aborted Pair-Verify). A paired
-      // Home hub writes the CCCD then waits ~2.5 s for 0x0001-0xFFFF
-      // before rediscovering; without it the session is attr=11 only.
-      if (!matched && event->subscribe.cur_indicate) {
-        if (hap_advertising_pairable()) {
-          ESP_LOGI(TAG, "Subscribe unmatched attr=%d; skip Service Changed while pairable",
+      // attr=11 is GATT Service Changed. Bluetooth Core Vol 3 Part G 7.1:
+      // indicate only when the GATT database is added/removed/modified.
+      // A characteristic value change is not a service change; HAP-BLE
+      // uses GSN (7.4.6) for that. Indicating 0x0001-0xFFFF on every
+      // connect made Home rediscover and drop the link (0x213).
+      if (!matched) {
+        if (event->subscribe.cur_indicate) {
+          ESP_LOGI(TAG,
+                   "Subscribe unmatched attr=%d (Service Changed); GATT DB is static, not indicating",
                    event->subscribe.attr_handle);
         } else {
-          ESP_LOGI(TAG, "Subscribe unmatched attr=%d (Service Changed); will indicate GATT range",
+          ESP_LOGI(TAG, "Subscribe unmatched attr=%d",
                    event->subscribe.attr_handle);
-          schedule_svc_changed_indicate();
         }
-      } else if (!matched) {
-        ESP_LOGI(TAG, "Subscribe unmatched attr=%d",
-                 event->subscribe.attr_handle);
       }
     }
     break;
@@ -1220,10 +1158,13 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
     break;
   case BLE_GAP_EVENT_CONN_UPDATE:
     ESP_LOGI(TAG, "Connection Update: conn=%d", event->conn_update.conn_handle);
-    if (s_need_adv_after_conn) {
-      s_need_adv_after_conn = false;
-      s_hold_adv_for_gatt = false;
-      restart_adv_for_new_link("conn-update");
+    // NimBLE may keep legacy advertising up when MAX_CONNECTIONS > 1.
+    // HAP R14 7.4.1.4 forbids that. Stop here (params already settled)
+    // rather than in CONNECT, which races ble_gap_update_params.
+    if (s_ble_conns > 0 && ble_gap_adv_active()) {
+      ESP_LOGI(TAG, "Stop advertising while connected (HAP 7.4.1.4)");
+      ble_gap_adv_stop();
+      s_last_adv_start_us = 0;
     }
     break;
   case BLE_GAP_EVENT_CONN_UPDATE_REQ:
