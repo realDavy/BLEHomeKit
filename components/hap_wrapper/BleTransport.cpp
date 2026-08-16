@@ -146,6 +146,8 @@ static bool s_pending_state_push = false;
 static bool s_push_scheduled = false;
 static uint16_t s_held_iids[8] = {};
 static uint8_t s_held_iid_count = 0;
+static uint16_t s_pushed_iids[8] = {};
+static uint8_t s_pushed_iid_count = 0;
 static bool s_gsn_cached = false;
 static uint16_t s_cached_gsn = 1;
 // HAP 7.4.6.1: first connected-session change is advertised after hangup.
@@ -179,6 +181,19 @@ static void hap_remember_held_iid(uint16_t iid) {
 
 static void hap_clear_held_iids() {
     s_held_iid_count = 0;
+}
+
+static bool hap_iid_listed(const uint16_t* iids, uint8_t count, uint16_t iid) {
+    for (uint8_t i = 0; i < count; ++i) {
+        if (iids[i] == iid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void hap_clear_pushed_iids() {
+    s_pushed_iid_count = 0;
 }
 
 static void hap_cancel_task(hap::common::TaskScheduler::TaskId& id) {
@@ -239,7 +254,13 @@ static void hap_schedule_controller_refresh(hap::common::TaskScheduler* schedule
             if (!session_manager_->has_subscribers(uuid)) { \
                 continue; \
             } \
-            send_connected_event(static_cast<uint16_t>(key.second)); \
+            const uint16_t iid = static_cast<uint16_t>(key.second); \
+            const bool held = hap_iid_listed(s_held_iids, s_held_iid_count, iid); \
+            if (hap_iid_listed(s_pushed_iids, s_pushed_iid_count, iid) && !held) { \
+                continue; \
+            } \
+            send_connected_event(iid); \
+            hap_remember_iid(s_pushed_iids, s_pushed_iid_count, iid); \
             ++sent; \
         } \
         if (sent == 0) { \
@@ -300,18 +321,16 @@ BleTransport::~BleTransport() {
 void BleTransport::start() {
     if (!config_.ble) return;
 
-    config_.system->log(platform::System::LogLevel::Info, "[BleTransport] Starting...");
+    config_.system->log(platform::System::LogLevel::Info,
+        "[BleTransport] Starting sync-rev=2 (immediate indicate, per-burst GSN, hangup GSN, no connected-write GSN)");
 
     config_.ble->set_disconnect_callback([this](uint16_t connection_id) {
         config_.system->log(platform::System::LogLevel::Info, 
             "[BleTransport] Device disconnected, connection_id=" + std::to_string(connection_id));
         
-        bool write_already_bumped_gsn = false;
-        if (auto* session = session_manager_->get_session(connection_id)) {
-            write_already_bumped_gsn = session->transaction.gsn_incremented;
-        }
         session_manager_->remove(connection_id);
         hap_close_disconnect_burst();
+        hap_clear_pushed_iids();
         s_gsn_bumped_since_disconnect = false;
         // Held knob changes never made it out as indications.
         const bool undelivered_local = s_pending_state_push || (s_held_iid_count > 0);
@@ -330,8 +349,8 @@ void BleTransport::start() {
         // after hangup must get their own GSN. Home ignored the hangup
         // bump in field logs; coalescing later turns into it swallowed them.
         const bool need_gsn = s_gsn_on_first_verify_drop ||
-                              ((!write_already_bumped_gsn) &&
-                               (s_gsn_pending_on_disconnect || undelivered_local));
+                              s_gsn_pending_on_disconnect ||
+                              undelivered_local;
         s_gsn_on_first_verify_drop = false;
         s_gsn_pending_on_disconnect = false;
         // Wait until Esp32Ble has restarted advertising (100 ms) so this
@@ -1316,10 +1335,13 @@ void BleTransport::process_transaction(uint16_t connection_id, TransactionState&
                      config_.system->log(platform::System::LogLevel::Info, 
                          "[BleTransport] Write IID=" + std::to_string(iid) + " success");
                      
-                     // Per HAP Spec 7.4.1.8: GSN increments on first characteristic change per connection
+                     // HAP 7.4.1.8: one GSN per connected session. 7.4.6.1:
+                     // advertise it after hangup. Bumping while Home is still
+                     // connected puts that GSN on the air; iOS consumes it and
+                     // then ignores the hangup advertisement.
                      if (!state.gsn_incremented) {
                          state.gsn_incremented = true;
-                         increment_gsn();
+                         s_gsn_pending_on_disconnect = true;
                      }
                      
                      // HAP Spec 7.3.5.5: Write-with-Response - return value if requested
@@ -1516,10 +1538,9 @@ void BleTransport::process_transaction(uint16_t connection_id, TransactionState&
                         config_.system->log(platform::System::LogLevel::Info, 
                             "[BleTransport] Execute Timed Write IID=" + std::to_string(state.timed_write_iid) + " success");
                         
-                        // Per HAP Spec 7.4.1.8: GSN increments on first characteristic change per connection
                         if (!state.gsn_incremented) {
                             state.gsn_incremented = true;
-                            increment_gsn();
+                            s_gsn_pending_on_disconnect = true;
                         }
                         
                     } else {
@@ -2184,9 +2205,12 @@ void BleTransport::handle_characteristic_change(uint64_t aid, uint64_t iid,
             " until controller finishes Pair-Verify");
     }
     else {
-        config_.system->log(platform::System::LogLevel::Debug,
+        config_.system->log(from_controller
+                ? platform::System::LogLevel::Debug
+                : platform::System::LogLevel::Info,
             "[BleTransport] No event sent for IID=" + std::to_string(iid) +
             " (connected=" + std::to_string(is_connected_) +
+            ", links=" + std::to_string(radio_links) +
             ", has_other_subs=" + std::to_string(has_other_subscribers) +
             ", supports_connected=" + std::to_string(supports_connected) + ")");
     }

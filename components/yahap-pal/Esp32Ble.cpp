@@ -56,10 +56,14 @@ static bool s_indicate_busy = false;
 static int s_indicate_start_depth = 0;
 static std::vector<QueuedIndicate> s_indicate_q;
 static esp_timer_handle_t s_indicate_watchdog = nullptr;
+static esp_timer_handle_t s_indicate_retry = nullptr;
 static bool s_restart_adv_after_conn_upd = false;
 static esp_timer_handle_t s_adv_after_conn_timer = nullptr;
 
 static void flush_indicate_queue();
+static void schedule_indicate_retry();
+static void enqueue_indicate(uint16_t conn_id, uint16_t attr_handle,
+                             std::span<const uint8_t> data);
 
 static void indicate_watchdog_stop() {
   if (s_indicate_watchdog != nullptr) {
@@ -92,6 +96,9 @@ static void indicate_watchdog_arm() {
 
 static void clear_indicate_queue() {
   indicate_watchdog_stop();
+  if (s_indicate_retry != nullptr) {
+    esp_timer_stop(s_indicate_retry);
+  }
   s_indicate_busy = false;
   s_indicate_q.clear();
 }
@@ -120,6 +127,44 @@ static int start_indicate(uint16_t conn_id, uint16_t attr_handle,
   return 0;
 }
 
+static void enqueue_indicate(uint16_t conn_id, uint16_t attr_handle,
+                             std::span<const uint8_t> data) {
+  for (auto &queued : s_indicate_q) {
+    if (queued.attr_handle == attr_handle) {
+      queued.conn_id = conn_id;
+      queued.data.assign(data.begin(), data.end());
+      return;
+    }
+  }
+  s_indicate_q.push_back(QueuedIndicate{
+      conn_id, attr_handle, 0,
+      std::vector<uint8_t>(data.begin(), data.end())});
+}
+
+static void indicate_retry_cb(void * /*arg*/) {
+  if (!s_indicate_busy) {
+    flush_indicate_queue();
+  }
+}
+
+static void schedule_indicate_retry() {
+  if (s_indicate_retry == nullptr) {
+    const esp_timer_create_args_t args = {
+        .callback = indicate_retry_cb,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "ind_retry",
+        .skip_unhandled_events = true,
+    };
+    if (esp_timer_create(&args, &s_indicate_retry) != ESP_OK) {
+      s_indicate_retry = nullptr;
+      return;
+    }
+  }
+  esp_timer_stop(s_indicate_retry);
+  esp_timer_start_once(s_indicate_retry, 50 * 1000);
+}
+
 static void flush_indicate_queue() {
   indicate_watchdog_stop();
   s_indicate_busy = false;
@@ -130,12 +175,15 @@ static void flush_indicate_queue() {
     if (rc == 0) {
       return;
     }
-    // ENOENT/EAGAIN: CCCD or the ATT procedure is not ready yet. Try
-    // once more after the in-flight indicate finishes.
-    if (next.retries == 0 && (rc == BLE_HS_ENOENT || rc == BLE_HS_EAGAIN)) {
-      next.retries = 1;
-      s_indicate_q.push_back(std::move(next));
+    if (next.retries < 5 &&
+        (rc == BLE_HS_ENOENT || rc == BLE_HS_EAGAIN || rc == BLE_HS_ENOMEM)) {
+      next.retries++;
+      s_indicate_q.insert(s_indicate_q.begin(), std::move(next));
+      schedule_indicate_retry();
+      return;
     }
+    ESP_LOGW(TAG, "Dropping indicate attr=%u after retries rc=%d",
+             next.attr_handle, rc);
   }
 }
 
@@ -720,19 +768,16 @@ bool Esp32Ble::send_indication(uint16_t connection_id,
   // NimBLE allows one GATT procedure at a time. Rapid encoder / Home writes
   // used to start overlapping indicates and iPhone dropped the link (0x213).
   if (s_indicate_busy) {
-    for (auto &queued : s_indicate_q) {
-      if (queued.attr_handle == attr_handle) {
-        queued.conn_id = connection_id;
-        queued.data.assign(data.begin(), data.end());
-        return true;
-      }
-    }
-    s_indicate_q.push_back(QueuedIndicate{
-        connection_id, attr_handle, 0,
-        std::vector<uint8_t>(data.begin(), data.end())});
+    enqueue_indicate(connection_id, attr_handle, data);
     return true;
   }
-  return start_indicate(connection_id, attr_handle, data) == 0;
+  const int rc = start_indicate(connection_id, attr_handle, data);
+  if (rc == 0) {
+    return true;
+  }
+  enqueue_indicate(connection_id, attr_handle, data);
+  schedule_indicate_retry();
+  return true;
 }
 
 int Esp32Ble::gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
