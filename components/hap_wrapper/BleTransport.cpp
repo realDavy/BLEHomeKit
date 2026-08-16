@@ -322,7 +322,7 @@ void BleTransport::start() {
     if (!config_.ble) return;
 
     config_.system->log(platform::System::LogLevel::Info,
-        "[BleTransport] Starting sync-rev=5 (quiet GATT until Pair-Verify; new adv instance only on GSN change)");
+        "[BleTransport] Starting sync-rev=6 (Service Changed indicate so Home can Pair-Verify)");
 
     config_.ble->set_disconnect_callback([this](uint16_t connection_id) {
         config_.system->log(platform::System::LogLevel::Info, 

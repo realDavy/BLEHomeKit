@@ -44,6 +44,8 @@ static uint16_t s_ble_conns = 0;
 static bool s_force_adv_restart = false;
 static bool s_hold_adv_for_gatt = false;
 static bool s_rnd_addr_ready = false;
+static bool s_svc_changed_pending = false;
+static esp_timer_handle_t s_svc_changed_timer = nullptr;
 static esp_timer_handle_t s_adv_ensure_timer = nullptr;
 static int s_adv_ensure_pass = 0;
 // ble_gap_adv_start() can return before ble_gap_adv_active() is true.
@@ -234,6 +236,36 @@ static void use_hap_static_random_addr() {
 }
 
 static void force_start_last_adv(const char *why);
+
+static void svc_changed_timer_cb(void * /*arg*/) {
+  ESP_LOGI(TAG, "Indicating GATT Service Changed (0x0001-0xFFFF)");
+  ble_svc_gatt_changed(0x0001, 0xffff);
+}
+
+static void schedule_svc_changed_indicate() {
+  if (s_svc_changed_pending) {
+    return;
+  }
+  s_svc_changed_pending = true;
+  if (s_svc_changed_timer == nullptr) {
+    const esp_timer_create_args_t args = {
+        .callback = svc_changed_timer_cb,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "svc_chg",
+        .skip_unhandled_events = true,
+    };
+    if (esp_timer_create(&args, &s_svc_changed_timer) != ESP_OK) {
+      s_svc_changed_timer = nullptr;
+      ESP_LOGW(TAG, "Failed to create Service Changed timer");
+      svc_changed_timer_cb(nullptr);
+      return;
+    }
+  }
+  esp_timer_stop(s_svc_changed_timer);
+  // Let the CCCD write complete before the indication, or iOS misses it.
+  esp_timer_start_once(s_svc_changed_timer, 50000);
+}
 
 static bool adv_start_in_flight() {
   if (ble_gap_adv_active() || s_last_adv_start_us == 0) {
@@ -452,11 +484,11 @@ Esp32Ble::Esp32Ble(hap::platform::Storage *storage) : storage_(storage) {
     char buf[BLE_UUID_STR_LEN];
     switch (ctxt->op) {
     case BLE_GATT_REGISTER_OP_SVC:
-      ESP_LOGD(TAG, "Reg Service: %s, handle=%d",
+      ESP_LOGI(TAG, "Reg Service: %s, handle=%d",
                ble_uuid_to_str(ctxt->svc.svc_def->uuid, buf), ctxt->svc.handle);
       break;
     case BLE_GATT_REGISTER_OP_CHR:
-      ESP_LOGD(TAG, "Reg Char: %s, val_handle=%d",
+      ESP_LOGI(TAG, "Reg Char: %s, val_handle=%d",
                ble_uuid_to_str(ctxt->chr.chr_def->uuid, buf),
                ctxt->chr.val_handle);
       break;
@@ -798,7 +830,7 @@ int Esp32Ble::gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
     return BLE_ATT_ERR_UNLIKELY;
 
   if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-    ESP_LOGD(TAG, "GATT Read: %s", ctx->uuid.c_str());
+    ESP_LOGI(TAG, "GATT Read: %s", ctx->uuid.c_str());
     if (ctx->on_read) {
       auto data = ctx->on_read(conn_handle);
       ESP_LOGD(TAG, "  -> Returning %d bytes", (int)data.size());
@@ -811,7 +843,7 @@ int Esp32Ble::gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
       data.resize(OS_MBUF_PKTLEN(ctxt->om));
       int rc = os_mbuf_copydata(ctxt->om, 0, data.size(), data.data());
 
-      ESP_LOGD(TAG, "GATT Write: %s, len=%d", ctx->uuid.c_str(),
+      ESP_LOGI(TAG, "GATT Write: %s, len=%d", ctx->uuid.c_str(),
                (int)data.size());
       if (data.size() < 20) {
         ESP_LOG_BUFFER_HEX_LEVEL(TAG, data.data(), data.size(), ESP_LOG_DEBUG);
@@ -1007,11 +1039,14 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
           self->enc_adv_timer_ = nullptr;
         }
       }
-      // Keep the controller on GATT until Pair-Verify. Restarting
-      // advertising ~60 ms after CONNECT (on CONN_UPDATE) made Home
-      // subscribe to Service Changed and time out at ~2.5 s with no
-      // Pair-Verify and no characteristic CCCDs.
+      // Do not restart advertising here. Keep the radio on GATT until
+      // Pair-Verify. After Service Changed subscribe we indicate the
+      // full handle range so iOS will rediscover and Pair-Verify.
       s_hold_adv_for_gatt = true;
+      s_svc_changed_pending = false;
+      if (s_svc_changed_timer != nullptr) {
+        esp_timer_stop(s_svc_changed_timer);
+      }
       if (s_ble_conns >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
         ESP_LOGI(TAG, "At max BLE links (%u); advertising after a drop",
                  static_cast<unsigned>(s_ble_conns));
@@ -1051,6 +1086,10 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
              event->disconnect.reason, static_cast<unsigned>(s_ble_conns));
     {
       s_hold_adv_for_gatt = false;
+      s_svc_changed_pending = false;
+      if (s_svc_changed_timer != nullptr) {
+        esp_timer_stop(s_svc_changed_timer);
+      }
       clear_indicate_queue();
       auto self = static_cast<Esp32Ble *>(arg);
       // Do not start advertising here. NimBLE is still cleaning up the
@@ -1070,15 +1109,27 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
              event->subscribe.conn_handle, event->subscribe.attr_handle,
              event->subscribe.reason, event->subscribe.cur_notify,
              event->subscribe.cur_indicate);
-    for (auto *ctx : all_contexts) {
-      if (ctx->val_handle == event->subscribe.attr_handle) {
-        if (ctx->on_subscribe) {
-          // HAP uses indications (cur_indicate), but also support notifications
-          bool subscribed = (event->subscribe.cur_notify > 0) ||
-                            (event->subscribe.cur_indicate > 0);
-          ctx->on_subscribe(event->subscribe.conn_handle, subscribed);
+    {
+      bool matched = false;
+      for (auto *ctx : all_contexts) {
+        if (ctx->val_handle == event->subscribe.attr_handle) {
+          matched = true;
+          ESP_LOGI(TAG, "Subscribe matched HAP uuid=%s", ctx->uuid.c_str());
+          if (ctx->on_subscribe) {
+            bool subscribed = (event->subscribe.cur_notify > 0) ||
+                              (event->subscribe.cur_indicate > 0);
+            ctx->on_subscribe(event->subscribe.conn_handle, subscribed);
+          }
+          break;
         }
-        break;
+      }
+      // iOS writes the GATT Service Changed CCCD then waits for an
+      // indication before rediscovering. We never sent one, so Home
+      // sat on attr=11 for ~2.5 s and hung up with no Pair-Verify.
+      if (!matched && event->subscribe.cur_indicate) {
+        ESP_LOGI(TAG, "Subscribe unmatched attr=%d (Service Changed); will indicate GATT range",
+                 event->subscribe.attr_handle);
+        schedule_svc_changed_indicate();
       }
     }
     break;
