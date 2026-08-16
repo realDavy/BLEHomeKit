@@ -322,7 +322,7 @@ void BleTransport::start() {
     if (!config_.ble) return;
 
     config_.system->log(platform::System::LogLevel::Info,
-        "[BleTransport] Starting sync-rev=7 (restore ads after first CONN_UPDATE; no Service Changed indicate)");
+        "[BleTransport] Starting sync-rev=8 (no Service Changed; hold ads during Pair-Setup)");
 
     config_.ble->set_disconnect_callback([this](uint16_t connection_id) {
         config_.system->log(platform::System::LogLevel::Info, 

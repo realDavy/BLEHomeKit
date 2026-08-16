@@ -235,6 +235,15 @@ static void use_hap_static_random_addr() {
 
 static void force_start_last_adv(const char *why);
 
+static bool hap_payload_pairable(const hap::platform::Ble::Advertisement &data) {
+  return data.manufacturer_data.size() >= 3 && data.manufacturer_data[0] == 0x06 &&
+         data.manufacturer_data[2] != 0;
+}
+
+static bool hap_advertising_pairable() {
+  return last_adv.has_value() && hap_payload_pairable(*last_adv);
+}
+
 static bool adv_start_in_flight() {
   if (ble_gap_adv_active() || s_last_adv_start_us == 0) {
     return false;
@@ -293,7 +302,7 @@ static void schedule_adv_ensure() {
 
 static void force_start_last_adv(const char *why) {
   if (s_hold_adv_for_gatt) {
-    ESP_LOGI(TAG, "Defer advertising (%s): wait for Pair-Verify", why);
+    ESP_LOGI(TAG, "Defer advertising (%s): GATT session in progress", why);
     return;
   }
   if (g_ble_instance == nullptr || !last_adv.has_value()) {
@@ -308,7 +317,7 @@ static void force_start_last_adv(const char *why) {
 
 static void restart_adv_for_new_link(const char *why) {
   if (s_hold_adv_for_gatt) {
-    ESP_LOGI(TAG, "Defer advertising (%s): wait for Pair-Verify", why);
+    ESP_LOGI(TAG, "Defer advertising (%s): GATT session in progress", why);
     return;
   }
   if (s_ble_conns >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
@@ -498,6 +507,16 @@ void Esp32Ble::start_advertising(const Advertisement &data,
 
   if (interval_ms > 20) {
     interval_ms = 20;
+  }
+
+  // Pair-Setup stays on this GATT link. Stop/start (or a Service Changed
+  // indicate) is what made Home show 失去连接. Keep the new payload for
+  // after hangup. SF=0 after Pair-Verify must still go on the air.
+  if (s_ble_conns > 0 && hap_payload_pairable(data) && !s_force_adv_restart) {
+    last_adv = data;
+    last_adv_interval = interval_ms;
+    ESP_LOGI(TAG, "Defer advertising (Pair-Setup in progress)");
+    return;
   }
 
   // HAP asked to advertise (Pair-Verify SF=0, disconnected GSN). The
@@ -1012,14 +1031,19 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
         }
       }
       // Do not restart advertising in CONNECT: that races with
-      // ble_gap_update_params (llc_con_upd assert). Hold until the first
-      // CONN_UPDATE, then restore ads the way sync-rev=3 did.
+      // ble_gap_update_params (llc_con_upd assert). Unpaired Pair-Setup
+      // keeps the radio on this GATT link until hangup. Paired reconnect
+      // restores ads after the first CONN_UPDATE (sync-rev=3).
       s_hold_adv_for_gatt = true;
-      s_need_adv_after_conn = true;
-      if (s_ble_conns >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
+      if (hap_advertising_pairable()) {
+        s_need_adv_after_conn = false;
+        ESP_LOGI(TAG, "Unpaired Pair-Setup: hold advertising while connected");
+      } else if (s_ble_conns >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
+        s_need_adv_after_conn = false;
         ESP_LOGI(TAG, "At max BLE links (%u); advertising after a drop",
                  static_cast<unsigned>(s_ble_conns));
       } else {
+        s_need_adv_after_conn = true;
         ESP_LOGI(TAG, "Hold advertising until first connection-parameter update");
       }
     }
