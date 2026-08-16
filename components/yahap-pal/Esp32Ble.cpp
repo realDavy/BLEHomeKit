@@ -44,6 +44,11 @@ static uint16_t s_ble_conns = 0;
 static bool s_force_adv_restart = false;
 static esp_timer_handle_t s_adv_ensure_timer = nullptr;
 static int s_adv_ensure_pass = 0;
+// ble_gap_adv_start() can return before ble_gap_adv_active() is true.
+// The 100 ms ensure-timer then force-restarted the same payload and tore
+// down the instance Home was about to use.
+static int64_t s_last_adv_start_us = 0;
+static constexpr int64_t kAdvStartSettleUs = 250000;
 
 struct QueuedIndicate {
   uint16_t conn_id = 0;
@@ -226,6 +231,13 @@ static void use_hap_static_random_addr() {
 
 static void force_start_last_adv(const char *why);
 
+static bool adv_start_in_flight() {
+  if (ble_gap_adv_active() || s_last_adv_start_us == 0) {
+    return false;
+  }
+  return (esp_timer_get_time() - s_last_adv_start_us) < kAdvStartSettleUs;
+}
+
 static void adv_ensure_timer_cb(void *arg) {
   (void)arg;
   if (!last_adv.has_value() || g_ble_instance == nullptr) {
@@ -233,6 +245,9 @@ static void adv_ensure_timer_cb(void *arg) {
   }
   if (ble_gap_adv_active()) {
     ESP_LOGI(TAG, "Advertising confirmed after disconnect (pass %d)",
+             s_adv_ensure_pass);
+  } else if (adv_start_in_flight()) {
+    ESP_LOGI(TAG, "Advertising start in flight after disconnect (pass %d)",
              s_adv_ensure_pass);
   } else {
     ESP_LOGW(TAG, "Advertising not active after disconnect; starting (pass %d)",
@@ -516,17 +531,21 @@ void Esp32Ble::start_advertising(const Advertisement &data,
 
   const bool force = s_force_adv_restart;
   s_force_adv_restart = false;
+  const bool adv_active = ble_gap_adv_active();
 
-  if (!force && same_payload && ble_gap_adv_active()) {
+  // Same GSN already on the air (or a start just issued). A stop/start
+  // here is what made Home miss GSN=31 for ~7 s in the sync-rev=3 logs.
+  if (!force && same_payload && (adv_active || adv_start_in_flight())) {
     ESP_LOGI(TAG, "Advertising already current, skip restart");
     return;
   }
 
-  // Flip SF / GSN without stopping. iPhone scans for SF=0 while still
-  // connected at the end of Add Accessory. After disconnect, force a
-  // real stop/start — in-place updates keep the while-connected instance
-  // that NimBLE then tears down (Home stays 未响应).
-  if (!force && ble_gap_adv_active() && last_adv_interval == interval_ms) {
+  // Flip SF / GSN without stopping only while a controller is connected.
+  // iPhone scans for SF=0 during Add Accessory on the existing instance.
+  // After hangup, iOS ignores in-place manufacturer-data updates — a
+  // disconnected GSN change must be a new advertising instance.
+  if (!force && s_ble_conns > 0 && adv_active &&
+      last_adv_interval == interval_ms) {
     const int rc = apply_advertising_fields(data);
     if (rc == 0) {
       last_adv = data;
@@ -538,11 +557,16 @@ void Esp32Ble::start_advertising(const Advertisement &data,
     ESP_LOGW(TAG, "In-place adv update failed rc=%d, restarting", rc);
   }
 
+  if (!force && s_ble_conns == 0 && !same_payload && adv_active) {
+    ESP_LOGI(TAG, "Advertising restart (disconnected GSN/payload change)");
+  }
+
   ble_gap_adv_stop();
   use_hap_static_random_addr();
 
   const int fields_rc = apply_advertising_fields(data);
   if (fields_rc != 0) {
+    s_last_adv_start_us = 0;
     return;
   }
 
@@ -558,15 +582,20 @@ void Esp32Ble::start_advertising(const Advertisement &data,
                                    &adv_params, ble_gap_event, this);
   if (rc != 0) {
     ESP_LOGE(TAG, "error enabling advertisement; rc=%d", rc);
+    s_last_adv_start_us = 0;
   } else {
     ESP_LOGI(TAG, "Advertising started");
     last_adv = data;
     last_adv_interval = interval_ms;
+    s_last_adv_start_us = esp_timer_get_time();
     log_adv_identity(data);
   }
 }
 
-void Esp32Ble::stop_advertising() { ble_gap_adv_stop(); }
+void Esp32Ble::stop_advertising() {
+  ble_gap_adv_stop();
+  s_last_adv_start_us = 0;
+}
 
 void Esp32Ble::disconnect(uint16_t connection_id) {
   ble_gap_terminate(connection_id, BLE_ERR_REM_USER_CONN_TERM);
@@ -1049,6 +1078,7 @@ int Esp32Ble::ble_gap_event(struct ble_gap_event *event, void *arg) {
       // link and will drop a start issued from this callback. Stop now
       // and start again from the 100 ms timer.
       ble_gap_adv_stop();
+      s_last_adv_start_us = 0;
       ESP_LOGI(TAG, "Advertising stopped on disconnect; will restart shortly");
       schedule_adv_ensure();
       if (self && self->disconnect_callback_) {

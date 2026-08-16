@@ -322,7 +322,7 @@ void BleTransport::start() {
     if (!config_.ble) return;
 
     config_.system->log(platform::System::LogLevel::Info,
-        "[BleTransport] Starting sync-rev=3 (immediate indicate, per-burst GSN, hangup GSN, disconnected GSN restarts adv)");
+        "[BleTransport] Starting sync-rev=4 (new adv instance only when GSN changes; no same-GSN hangup restart)");
 
     config_.ble->set_disconnect_callback([this](uint16_t connection_id) {
         config_.system->log(platform::System::LogLevel::Info, 
@@ -372,10 +372,13 @@ void BleTransport::start() {
             } else {
                 increment_gsn();
             }
-        } else if (config_.scheduler) {
-            config_.scheduler->schedule_once(150, [this]() { update_advertising(); });
         } else {
-            update_advertising();
+            // Read-only Home poll: nothing changed. Esp32Ble already
+            // restarts the current GSN from the disconnect ensure-timer.
+            // Calling update_advertising() here stop/started the same
+            // payload and Home missed the instance for seconds.
+            config_.system->log(platform::System::LogLevel::Info,
+                "[BleTransport] Hangup: no state change, leave advertising as-is");
         }
     });
 
@@ -753,13 +756,10 @@ void BleTransport::update_advertising() {
         " CN=" + std::to_string(config_number) +
         (status_flags ? " (pairable)" : " (paired)"));
 
-    // While connected, update the payload in place (Add Accessory looks
-    // for SF=0 on the existing instance). While disconnected, a GSN
-    // change must be a new advertising instance — iOS ignored in-place
-    // manufacturer-data updates after hangup (GSN=19 sat for ~40 s).
-    if (config_.ble->active_connections() == 0) {
-        config_.ble->stop_advertising();
-    }
+    // Esp32Ble updates in place while connected (Add Accessory SF=0)
+    // and stop/starts only when a disconnected GSN actually changes.
+    // Do not stop here: a same-GSN refresh after hangup tore down the
+    // instance Home was scanning (GSN=31 sat ~7 s in field logs).
     config_.ble->start_advertising(adv, 20);
 }
 
