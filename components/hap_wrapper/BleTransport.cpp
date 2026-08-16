@@ -322,7 +322,7 @@ void BleTransport::start() {
     if (!config_.ble) return;
 
     config_.system->log(platform::System::LogLevel::Info,
-        "[BleTransport] Starting sync-rev=2 (immediate indicate, per-burst GSN, hangup GSN, no connected-write GSN)");
+        "[BleTransport] Starting sync-rev=3 (immediate indicate, per-burst GSN, hangup GSN, disconnected GSN restarts adv)");
 
     config_.ble->set_disconnect_callback([this](uint16_t connection_id) {
         config_.system->log(platform::System::LogLevel::Info, 
@@ -753,6 +753,13 @@ void BleTransport::update_advertising() {
         " CN=" + std::to_string(config_number) +
         (status_flags ? " (pairable)" : " (paired)"));
 
+    // While connected, update the payload in place (Add Accessory looks
+    // for SF=0 on the existing instance). While disconnected, a GSN
+    // change must be a new advertising instance — iOS ignored in-place
+    // manufacturer-data updates after hangup (GSN=19 sat for ~40 s).
+    if (config_.ble->active_connections() == 0) {
+        config_.ble->stop_advertising();
+    }
     config_.ble->start_advertising(adv, 20);
 }
 
@@ -2202,7 +2209,8 @@ void BleTransport::handle_characteristic_change(uint64_t aid, uint64_t iid,
         s_pending_state_push = true;
         config_.system->log(platform::System::LogLevel::Info,
             "[BleTransport] Hold event IID=" + std::to_string(iid) +
-            " until controller finishes Pair-Verify");
+            (encrypted ? " until CCCDs are registered"
+                       : " until controller finishes Pair-Verify"));
     }
     else {
         config_.system->log(from_controller
