@@ -8,10 +8,11 @@
 // peer confirm before the next ATT procedure), advertise one GSN per
 // disconnected knob burst and a separate hangup GSN so a later
 // gesture is not swallowed (HAP 7.4.6.1 vs 7.4.6.3), push current
-// On/Brightness/CT as soon as Pair-Verify
-// and CCCDs are both ready, do not treat a Home write as "still
-// pairing" just because the writer is the only subscriber, avoid
-// 500 ms advertising after drop, and disconnect after Home
+// On/Brightness/CT after the Pair-Verify GATT response has been
+// fully read (not on the write that prepares it), hold local events
+// while a HAP-BLE PDU is in flight, do not treat a Home write as
+// "still pairing" just because the writer is the only subscriber,
+// avoid 500 ms advertising after drop, and disconnect after Home
 // RemovePairing so advertising returns to SF=1.
 #include "hap/transport/BleTransport.hpp"
 #include "hap/common/TaskScheduler.hpp"
@@ -227,6 +228,31 @@ static bool hap_session_encrypted(hap::transport::ble::BleSessionManager* sessio
     return false;
 }
 
+// NimBLE allows one ATT procedure per link. Starting a GATT indication
+// while Home is still reading a HAP-BLE response (Pair-Verify, Opcode 3)
+// means the confirm never arrives and the 800 ms watchdog flushes the
+// rest of the queue.
+static bool hap_pdu_busy(hap::transport::ble::BleSessionManager* sessions) {
+    if (!sessions) {
+        return false;
+    }
+    for (uint16_t id : sessions->get_connection_ids()) {
+        auto* session = sessions->get_session(id);
+        if (!session) {
+            continue;
+        }
+        const auto& t = session->transaction;
+        if (t.active) {
+            return true;
+        }
+        if (!t.response_buffer.empty() &&
+            t.response_read_offset < t.response_buffer.size()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void hap_schedule_controller_refresh(hap::common::TaskScheduler* scheduler,
                                            std::function<void()> fn) {
     if (!fn) {
@@ -246,6 +272,14 @@ static void hap_schedule_controller_refresh(hap::common::TaskScheduler* schedule
     do { \
         if (!session_manager_ || !hap_session_encrypted(session_manager_.get())) { \
             s_pending_state_push = true; \
+            break; \
+        } \
+        if (hap_pdu_busy(session_manager_.get())) { \
+            s_pending_state_push = true; \
+            if (config_.system) { \
+                config_.system->log(platform::System::LogLevel::Info, \
+                    "[BleTransport] Defer current-state push until HAP-BLE is idle"); \
+            } \
             break; \
         } \
         hap_note_controller_connected(); \
@@ -322,7 +356,7 @@ void BleTransport::start() {
     if (!config_.ble) return;
 
     config_.system->log(platform::System::LogLevel::Info,
-        "[BleTransport] Starting sync-rev=8 (no Service Changed; hold ads during Pair-Setup)");
+        "[BleTransport] Starting sync-rev=9 (indicate after HAP-BLE is idle)");
 
     config_.ble->set_disconnect_callback([this](uint16_t connection_id) {
         config_.system->log(platform::System::LogLevel::Info, 
@@ -979,19 +1013,23 @@ std::vector<uint8_t> BleTransport::handle_hap_read(uint16_t connection_id) {
         " bytes (offset=" + std::to_string(state.response_read_offset) +
         " mtu=" + std::to_string(mtu) + ")");
 
-    if (state.response_read_offset >= buf.size() &&
-        s_disconnect_after_read == connection_id && config_.ble) {
-        s_disconnect_after_read = 0;
-        const uint16_t conn = connection_id;
-        auto disconnect = [this, conn]() {
-            config_.system->log(platform::System::LogLevel::Info,
-                "[BleTransport] Disconnecting after RemovePairing");
-            config_.ble->disconnect(conn);
-        };
-        if (config_.scheduler) {
-            config_.scheduler->schedule_once(200, std::move(disconnect));
-        } else {
-            disconnect();
+    if (state.response_read_offset >= buf.size()) {
+        if (s_pending_state_push || s_held_iid_count > 0) {
+            HAP_SCHEDULE_PUSH_CURRENT_STATE();
+        }
+        if (s_disconnect_after_read == connection_id && config_.ble) {
+            s_disconnect_after_read = 0;
+            const uint16_t conn = connection_id;
+            auto disconnect = [this, conn]() {
+                config_.system->log(platform::System::LogLevel::Info,
+                    "[BleTransport] Disconnecting after RemovePairing");
+                config_.ble->disconnect(conn);
+            };
+            if (config_.scheduler) {
+                config_.scheduler->schedule_once(200, std::move(disconnect));
+            } else {
+                disconnect();
+            }
         }
     }
     return fragment;
@@ -1259,7 +1297,8 @@ void BleTransport::process_transaction(uint16_t connection_id, TransactionState&
                     hap_schedule_paired_advertising(this, config_.scheduler);
                 }
                 if (ctx.is_encrypted()) {
-                    HAP_SCHEDULE_PUSH_CURRENT_STATE();
+                    // Home still has to GATT-Read this Pair-Verify response.
+                    s_pending_state_push = true;
                 }
              } else if (type == 0x50) { // Pairings
                 req.path = "/pairings";
@@ -1802,7 +1841,8 @@ bool BleTransport::process_characteristic_write(uint16_t connection_id, uint16_t
             hap_schedule_paired_advertising(this, config_.scheduler);
         }
         if (session.context->is_encrypted()) {
-            HAP_SCHEDULE_PUSH_CURRENT_STATE();
+            // Home still has to GATT-Read this Pair-Verify response.
+            s_pending_state_push = true;
         }
         uint8_t status = (resp.status == Status::OK) ? 0x00 : 0x05;
         send_response(connection_id, tid, uuid, status, resp.body);
@@ -2176,6 +2216,15 @@ void BleTransport::handle_characteristic_change(uint64_t aid, uint64_t iid,
         config_.ble ? config_.ble->active_connections() : 0;
     const bool encrypted = hap_session_encrypted(session_manager_.get());
     is_connected_ = encrypted;
+
+    if (!from_controller && hap_pdu_busy(session_manager_.get())) {
+        hap_remember_held_iid(static_cast<uint16_t>(iid));
+        s_pending_state_push = true;
+        config_.system->log(platform::System::LogLevel::Info,
+            "[BleTransport] Hold event IID=" + std::to_string(iid) +
+            " until HAP-BLE is idle");
+        return;
+    }
 
     if (encrypted && supports_connected && has_other_subscribers) {
         s_exclude_conn_id = exclude_conn_id;

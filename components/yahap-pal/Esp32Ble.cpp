@@ -61,6 +61,7 @@ struct QueuedIndicate {
 
 static bool s_indicate_busy = false;
 static int s_indicate_start_depth = 0;
+static int s_gatt_access_depth = 0;
 static std::vector<QueuedIndicate> s_indicate_q;
 static esp_timer_handle_t s_indicate_watchdog = nullptr;
 static esp_timer_handle_t s_indicate_retry = nullptr;
@@ -69,6 +70,7 @@ static void flush_indicate_queue();
 static void schedule_indicate_retry();
 static void enqueue_indicate(uint16_t conn_id, uint16_t attr_handle,
                              std::span<const uint8_t> data);
+static void indicate_watchdog_arm();
 
 static void indicate_watchdog_stop() {
   if (s_indicate_watchdog != nullptr) {
@@ -77,6 +79,10 @@ static void indicate_watchdog_stop() {
 }
 
 static void indicate_watchdog_cb(void * /*arg*/) {
+  if (s_gatt_access_depth > 0) {
+    indicate_watchdog_arm();
+    return;
+  }
   ESP_LOGW(TAG, "Indicate confirmation timed out; flushing queue");
   flush_indicate_queue();
 }
@@ -135,8 +141,7 @@ static int start_indicate(uint16_t conn_id, uint16_t attr_handle,
 static void enqueue_indicate(uint16_t conn_id, uint16_t attr_handle,
                              std::span<const uint8_t> data) {
   for (auto &queued : s_indicate_q) {
-    if (queued.attr_handle == attr_handle) {
-      queued.conn_id = conn_id;
+    if (queued.conn_id == conn_id && queued.attr_handle == attr_handle) {
       queued.data.assign(data.begin(), data.end());
       return;
     }
@@ -519,6 +524,14 @@ void Esp32Ble::start_advertising(const Advertisement &data,
     return;
   }
 
+  if (s_ble_conns >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
+    last_adv = data;
+    last_adv_interval = interval_ms;
+    ESP_LOGI(TAG, "Skip advertising; at max BLE links (%u)",
+             static_cast<unsigned>(s_ble_conns));
+    return;
+  }
+
   // HAP asked to advertise (Pair-Verify SF=0, disconnected GSN). The
   // radio is free for GAP again.
   s_hold_adv_for_gatt = false;
@@ -590,6 +603,11 @@ void Esp32Ble::start_advertising(const Advertisement &data,
     last_adv_interval = interval_ms;
     s_last_adv_start_us = esp_timer_get_time();
     log_adv_identity(data);
+  } else if (rc == BLE_HS_ENOMEM &&
+             s_ble_conns >= CONFIG_BT_NIMBLE_MAX_CONNECTIONS) {
+    last_adv = data;
+    last_adv_interval = interval_ms;
+    ESP_LOGI(TAG, "Skip advertising; NimBLE out of buffers at max links");
   } else {
     ESP_LOGE(TAG, "error enabling advertisement; rc=%d", rc);
     s_last_adv_start_us = 0;
@@ -820,13 +838,16 @@ int Esp32Ble::gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
   if (!ctx)
     return BLE_ATT_ERR_UNLIKELY;
 
+  ++s_gatt_access_depth;
+  int result = 0;
+
   if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
     ESP_LOGI(TAG, "GATT Read: %s", ctx->uuid.c_str());
     if (ctx->on_read) {
       auto data = ctx->on_read(conn_handle);
       ESP_LOGD(TAG, "  -> Returning %d bytes", (int)data.size());
       int rc = os_mbuf_append(ctxt->om, data.data(), data.size());
-      return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+      result = rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
   } else if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
     if (ctx->on_write) {
@@ -842,12 +863,16 @@ int Esp32Ble::gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
 
       if (rc == 0) {
         ctx->on_write(conn_handle, data, false);
-        return 0;
+        result = 0;
       }
     }
   }
 
-  return 0;
+  --s_gatt_access_depth;
+  if (s_indicate_busy && s_gatt_access_depth == 0) {
+    indicate_watchdog_arm();
+  }
+  return result;
 }
 
 int Esp32Ble::gatt_svr_dsc_access(uint16_t conn_handle, uint16_t attr_handle,
